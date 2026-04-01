@@ -1,4 +1,4 @@
-# domain/models/persistence_models.py
+# albaranes_persistence/domain/models/persistence_models.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +15,42 @@ class StoredFile:
     ia_input_web_url: str | None = None
     ia_output_relative_path: str | None = None
     ia_output_web_url: str | None = None
+    gem_input_relative_path: str | None = None
+    gem_input_web_url: str | None = None
+    gem_output_relative_path: str | None = None
+    gem_output_web_url: str | None = None
+
+    @property
+    def openai_input_relative_path(self) -> str | None:
+        return self.ia_input_relative_path
+
+    @property
+    def openai_input_web_url(self) -> str | None:
+        return self.ia_input_web_url
+
+    @property
+    def openai_output_relative_path(self) -> str | None:
+        return self.ia_output_relative_path
+
+    @property
+    def openai_output_web_url(self) -> str | None:
+        return self.ia_output_web_url
+
+    @property
+    def gemini_input_relative_path(self) -> str | None:
+        return self.gem_input_relative_path
+
+    @property
+    def gemini_input_web_url(self) -> str | None:
+        return self.gem_input_web_url
+
+    @property
+    def gemini_output_relative_path(self) -> str | None:
+        return self.gem_output_relative_path
+
+    @property
+    def gemini_output_web_url(self) -> str | None:
+        return self.gem_output_web_url
 
 
 @dataclass(frozen=True)

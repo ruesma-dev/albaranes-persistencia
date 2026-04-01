@@ -1,4 +1,4 @@
-# application/pipelines/persist_albaran_pipeline.py
+# albaranes_persistence/application/pipelines/persist_albaran_pipeline.py
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from application.services.albaran_normalizer import AlbaranNormalizer
-from domain.models.extraction_models import ExtractionEnvelope
+from domain.models.extraction_models import ExtractionEnvelope, LineaAlbaran
 from domain.ports.albaran_repository import AlbaranRepository
 from domain.ports.document_storage import DocumentStorage
 
@@ -56,6 +56,13 @@ class PersistAlbaranPipeline:
                 "El sha256 del adjunto no coincide con el sha256 del envelope."
             )
 
+        if envelope.gemini is not None:
+            gem_expected_sha = envelope.gemini.meta.source_sha256.strip().lower()
+            if gem_expected_sha and gem_expected_sha != sha256:
+                raise ValueError(
+                    "El sha256 del adjunto no coincide con el sha256 del bloque gemini."
+                )
+
         existing = self._repository.get_by_sha256(sha256)
         if existing is not None:
             logger.info(
@@ -71,40 +78,24 @@ class PersistAlbaranPipeline:
                 stored_lines=existing.stored_lines,
             )
 
-        cabecera = envelope.data.cabecera
-        fecha_iso = self._normalizer.normalize_date(cabecera.fecha)
-        if fecha_iso and cabecera.fecha != fecha_iso:
-            envelope = envelope.model_copy(
-                update={
-                    "data": envelope.data.model_copy(
-                        update={
-                            "cabecera": cabecera.model_copy(
-                                update={"fecha": fecha_iso}
-                            )
-                        }
-                    )
-                }
-            )
+        envelope = self._normalize(envelope)
 
-        debug = envelope.debug or {}
-        if not isinstance(debug, dict):
-            debug = {}
-
-        ia_input_payload = debug.get("openai_request")
-        if not isinstance(ia_input_payload, dict):
-            ia_input_payload = None
-
-        ia_output_payload = debug.get("openai_response")
-        if not isinstance(ia_output_payload, dict):
-            ia_output_payload = None
+        openai_debug = envelope.debug if isinstance(envelope.debug, dict) else {}
+        gemini_debug = (
+            envelope.gemini.debug
+            if envelope.gemini is not None and isinstance(envelope.gemini.debug, dict)
+            else {}
+        )
 
         stored_file = self._document_storage.upload(
             filename=request.filename,
             mime_type=request.mime_type,
             file_bytes=request.file_bytes,
             source_sha256=sha256,
-            ia_input_payload=ia_input_payload,
-            ia_output_payload=ia_output_payload,
+            ia_input_payload=self._coerce_dict(openai_debug.get("openai_request")),
+            ia_output_payload=self._coerce_dict(openai_debug.get("openai_response")),
+            gem_input_payload=self._coerce_dict(gemini_debug.get("gemini_request")),
+            gem_output_payload=self._coerce_dict(gemini_debug.get("gemini_response")),
         )
         saved = self._repository.save(
             envelope=envelope,
@@ -118,3 +109,54 @@ class PersistAlbaranPipeline:
             duplicate=False,
             stored_lines=saved.stored_lines,
         )
+
+    def _normalize(self, envelope: ExtractionEnvelope) -> ExtractionEnvelope:
+        openai_envelope = envelope.model_copy(
+            update={"data": self._normalize_document(envelope.data)}
+        )
+
+        gemini_envelope = openai_envelope.gemini
+        if gemini_envelope is not None:
+            gemini_envelope = gemini_envelope.model_copy(
+                update={"data": self._normalize_document(gemini_envelope.data)}
+            )
+            openai_envelope = openai_envelope.model_copy(
+                update={"gemini": gemini_envelope}
+            )
+
+        return openai_envelope
+
+    def _normalize_document(self, document):
+        cabecera = document.cabecera
+        fecha_iso = self._normalizer.normalize_date(cabecera.fecha)
+        normalized_cabecera = cabecera
+        if fecha_iso and cabecera.fecha != fecha_iso:
+            normalized_cabecera = cabecera.model_copy(update={"fecha": fecha_iso})
+
+        normalized_lines = [
+            self._normalize_line_confidence(line) for line in document.lineas
+        ]
+        return document.model_copy(
+            update={
+                "cabecera": normalized_cabecera,
+                "lineas": normalized_lines,
+            }
+        )
+
+    @staticmethod
+    def _normalize_line_confidence(line: LineaAlbaran) -> LineaAlbaran:
+        confidence = line.confianza_pct
+        if confidence is None:
+            return line
+
+        normalized = float(confidence)
+        if 0.0 <= normalized <= 1.0:
+            normalized *= 100.0
+        normalized = max(0.0, min(100.0, normalized))
+        if normalized == confidence:
+            return line
+        return line.model_copy(update={"confianza_pct": normalized})
+
+    @staticmethod
+    def _coerce_dict(value: Any) -> Dict[str, Any]:
+        return value if isinstance(value, dict) else {}

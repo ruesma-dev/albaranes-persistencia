@@ -50,7 +50,11 @@ class DocumentoAlbaran(StrictSchemaModel):
     lineas: List[LineaAlbaran]
 
 
-class ExtractionEnvelope(StrictSchemaModel):
+class ProviderExtractionEnvelope(StrictSchemaModel):
     meta: ExtractionMeta
     data: DocumentoAlbaran
     debug: Dict[str, Any] | None = None
+
+
+class ExtractionEnvelope(ProviderExtractionEnvelope):
+    gemini: ProviderExtractionEnvelope | None = None

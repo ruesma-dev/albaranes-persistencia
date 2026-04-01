@@ -426,6 +426,8 @@ class SharePointDocumentStorage(DocumentStorage):
     @staticmethod
     def _artifact_name(final_name: str, artifact_type: str) -> str:
         path = PurePosixPath(final_name)
+        if artifact_type.startswith("gemini_"):
+            return f"{path.stem}.{artifact_type}_GEM.json"
         return f"{path.stem}.{artifact_type}.json"
 
     @staticmethod
@@ -475,11 +477,17 @@ class SharePointDocumentStorage(DocumentStorage):
         source_sha256: str,
         ia_input_payload: dict[str, Any] | None = None,
         ia_output_payload: dict[str, Any] | None = None,
+        gem_input_payload: dict[str, Any] | None = None,
+        gem_output_payload: dict[str, Any] | None = None,
     ) -> StoredFile:
         ia_input_relative_path: str | None = None
         ia_input_web_url: str | None = None
         ia_output_relative_path: str | None = None
         ia_output_web_url: str | None = None
+        gem_input_relative_path: str | None = None
+        gem_input_web_url: str | None = None
+        gem_output_relative_path: str | None = None
+        gem_output_web_url: str | None = None
 
         if self._mode == "drive_id":
             assert self._drive_id is not None
@@ -532,6 +540,28 @@ class SharePointDocumentStorage(DocumentStorage):
                     artifact_name=self._artifact_name(final_name, "openai_response"),
                     payload=ia_output_payload,
                 )
+            if gem_input_payload:
+                gem_input_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "gemini_request")
+                )
+                _, gem_input_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "gemini_request"),
+                    payload=gem_input_payload,
+                )
+            if gem_output_payload:
+                gem_output_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "gemini_response")
+                )
+                _, gem_output_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "gemini_response"),
+                    payload=gem_output_payload,
+                )
 
         elif self._mode == "folder_url":
             base_folder = self._resolve_folder_from_share_url()
@@ -580,6 +610,28 @@ class SharePointDocumentStorage(DocumentStorage):
                     artifact_name=self._artifact_name(final_name, "openai_response"),
                     payload=ia_output_payload,
                 )
+            if gem_input_payload:
+                gem_input_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "gemini_request")
+                )
+                _, gem_input_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "gemini_request"),
+                    payload=gem_input_payload,
+                )
+            if gem_output_payload:
+                gem_output_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "gemini_response")
+                )
+                _, gem_output_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "gemini_response"),
+                    payload=gem_output_payload,
+                )
 
         else:
             site_id = self._resolve_site_id()
@@ -614,6 +666,24 @@ class SharePointDocumentStorage(DocumentStorage):
                         payload=ia_output_payload,
                     )
                 )
+            if gem_input_payload:
+                gem_input_relative_path, gem_input_web_url = (
+                    self._upload_artifact_by_relative_path(
+                        drive_id=drive_id,
+                        relative_dir=relative_dir,
+                        artifact_name=self._artifact_name(final_name, "gemini_request"),
+                        payload=gem_input_payload,
+                    )
+                )
+            if gem_output_payload:
+                gem_output_relative_path, gem_output_web_url = (
+                    self._upload_artifact_by_relative_path(
+                        drive_id=drive_id,
+                        relative_dir=relative_dir,
+                        artifact_name=self._artifact_name(final_name, "gemini_response"),
+                        payload=gem_output_payload,
+                    )
+                )
 
         item_id = str(uploaded.get("id") or "").strip()
         if not item_id:
@@ -637,4 +707,8 @@ class SharePointDocumentStorage(DocumentStorage):
             ia_input_web_url=ia_input_web_url,
             ia_output_relative_path=ia_output_relative_path,
             ia_output_web_url=ia_output_web_url,
+            gem_input_relative_path=gem_input_relative_path,
+            gem_input_web_url=gem_input_web_url,
+            gem_output_relative_path=gem_output_relative_path,
+            gem_output_web_url=gem_output_web_url,
         )
