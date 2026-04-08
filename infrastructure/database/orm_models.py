@@ -1,7 +1,15 @@
-# albaranes_persistence/infrastructure/database/orm_models.py
+# infrastructure/database/orm_models.py
 from __future__ import annotations
 
-from sqlalchemy import Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -50,6 +58,10 @@ class _DocumentColumnsMixin:
     email_received_datetime: Mapped[str | None] = mapped_column(String(64))
     raw_context_json: Mapped[str | None] = mapped_column(Text)
     raw_extraction_json: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence_pct_calc: Mapped[float | None] = mapped_column(Float)
+    review_required: Mapped[bool | None] = mapped_column(Boolean)
+    review_reasons_json: Mapped[str | None] = mapped_column(Text)
+    comparison_summary_json: Mapped[str | None] = mapped_column(Text)
     created_at_utc: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
@@ -67,6 +79,10 @@ class _LineColumnsMixin:
     precio_neto: Mapped[float | None] = mapped_column(Float)
     codigo_imputacion: Mapped[str | None] = mapped_column(String(128))
     confianza_pct: Mapped[float | None] = mapped_column(Float)
+    confidence_pct_calc: Mapped[float | None] = mapped_column(Float)
+    line_match_score: Mapped[float | None] = mapped_column(Float)
+    comparison_status_json: Mapped[str | None] = mapped_column(Text)
+    field_scores_json: Mapped[str | None] = mapped_column(Text)
 
 
 class AlbaranDocumentOrm(_DocumentColumnsMixin, Base):
@@ -126,3 +142,8 @@ class AlbaranLineMergeOrm(_LineColumnsMixin, Base):
     document: Mapped[AlbaranDocumentMergeOrm] = relationship(
         back_populates="lines"
     )
+
+
+# Alias de compatibilidad con nombres anteriores.
+AlbaranDocumentGemOrm = AlbaranDocumentMergeOrm
+AlbaranLineGemOrm = AlbaranLineMergeOrm

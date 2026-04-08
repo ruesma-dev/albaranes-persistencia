@@ -1,4 +1,4 @@
-# albaranes_persistence/application/pipelines/persist_albaran_pipeline.py
+# application/pipelines/persist_albaran_pipeline.py
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from application.services.albaran_normalizer import AlbaranNormalizer
-from domain.models.extraction_models import ExtractionEnvelope, LineaAlbaran
+from domain.models.extraction_models import ExtractionEnvelope, ProviderExtractionEnvelope
 from domain.ports.albaran_repository import AlbaranRepository
 from domain.ports.document_storage import DocumentStorage
 
@@ -50,18 +50,7 @@ class PersistAlbaranPipeline:
 
         envelope = ExtractionEnvelope.model_validate(request.extraction_envelope)
         sha256 = hashlib.sha256(request.file_bytes).hexdigest()
-        expected_sha = envelope.meta.source_sha256.strip().lower()
-        if expected_sha and expected_sha != sha256:
-            raise ValueError(
-                "El sha256 del adjunto no coincide con el sha256 del envelope."
-            )
-
-        if envelope.gemini is not None:
-            gem_expected_sha = envelope.gemini.meta.source_sha256.strip().lower()
-            if gem_expected_sha and gem_expected_sha != sha256:
-                raise ValueError(
-                    "El sha256 del adjunto no coincide con el sha256 del bloque gemini."
-                )
+        self._validate_sha256(envelope=envelope, sha256=sha256)
 
         existing = self._repository.get_by_sha256(sha256)
         if existing is not None:
@@ -79,7 +68,6 @@ class PersistAlbaranPipeline:
             )
 
         envelope = self._normalize(envelope)
-
         openai_debug = envelope.debug if isinstance(envelope.debug, dict) else {}
         gemini_debug = (
             envelope.gemini.debug
@@ -110,52 +98,56 @@ class PersistAlbaranPipeline:
             stored_lines=saved.stored_lines,
         )
 
+    def _validate_sha256(self, *, envelope: ExtractionEnvelope, sha256: str) -> None:
+        providers: list[tuple[str, ProviderExtractionEnvelope]] = [("openai", envelope)]
+        if envelope.gemini is not None:
+            providers.append(("gemini", envelope.gemini))
+        if envelope.google_document_ai is not None:
+            providers.append(("google_document_ai", envelope.google_document_ai))
+        if envelope.azure_document_intelligence is not None:
+            providers.append(
+                ("azure_document_intelligence", envelope.azure_document_intelligence)
+            )
+
+        for provider_name, provider_envelope in providers:
+            expected_sha = provider_envelope.meta.source_sha256.strip().lower()
+            if expected_sha and expected_sha != sha256:
+                raise ValueError(
+                    "El sha256 del adjunto no coincide con el bloque "
+                    f"{provider_name}."
+                )
+
     def _normalize(self, envelope: ExtractionEnvelope) -> ExtractionEnvelope:
-        openai_envelope = envelope.model_copy(
-            update={"data": self._normalize_document(envelope.data)}
-        )
-
-        gemini_envelope = openai_envelope.gemini
-        if gemini_envelope is not None:
-            gemini_envelope = gemini_envelope.model_copy(
-                update={"data": self._normalize_document(gemini_envelope.data)}
-            )
-            openai_envelope = openai_envelope.model_copy(
-                update={"gemini": gemini_envelope}
-            )
-
-        return openai_envelope
-
-    def _normalize_document(self, document):
-        cabecera = document.cabecera
-        fecha_iso = self._normalizer.normalize_date(cabecera.fecha)
-        normalized_cabecera = cabecera
-        if fecha_iso and cabecera.fecha != fecha_iso:
-            normalized_cabecera = cabecera.model_copy(update={"fecha": fecha_iso})
-
-        normalized_lines = [
-            self._normalize_line_confidence(line) for line in document.lineas
-        ]
-        return document.model_copy(
+        normalized = envelope.model_copy(
             update={
-                "cabecera": normalized_cabecera,
-                "lineas": normalized_lines,
+                "data": self._normalizer.normalize_provider_document(
+                    document=envelope.data,
+                    provider_origin="openai",
+                )
             }
         )
 
-    @staticmethod
-    def _normalize_line_confidence(line: LineaAlbaran) -> LineaAlbaran:
-        confidence = line.confianza_pct
-        if confidence is None:
-            return line
+        provider_updates: dict[str, ProviderExtractionEnvelope] = {}
+        optional_providers = {
+            "gemini": normalized.gemini,
+            "google_document_ai": normalized.google_document_ai,
+            "azure_document_intelligence": normalized.azure_document_intelligence,
+        }
+        for provider_name, provider_envelope in optional_providers.items():
+            if provider_envelope is None:
+                continue
+            provider_updates[provider_name] = provider_envelope.model_copy(
+                update={
+                    "data": self._normalizer.normalize_provider_document(
+                        document=provider_envelope.data,
+                        provider_origin=provider_name,
+                    )
+                }
+            )
 
-        normalized = float(confidence)
-        if 0.0 <= normalized <= 1.0:
-            normalized *= 100.0
-        normalized = max(0.0, min(100.0, normalized))
-        if normalized == confidence:
-            return line
-        return line.model_copy(update={"confianza_pct": normalized})
+        if provider_updates:
+            normalized = normalized.model_copy(update=provider_updates)
+        return normalized
 
     @staticmethod
     def _coerce_dict(value: Any) -> Dict[str, Any]:

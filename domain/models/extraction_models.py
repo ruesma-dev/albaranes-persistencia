@@ -58,3 +58,5 @@ class ProviderExtractionEnvelope(StrictSchemaModel):
 
 class ExtractionEnvelope(ProviderExtractionEnvelope):
     gemini: ProviderExtractionEnvelope | None = None
+    google_document_ai: ProviderExtractionEnvelope | None = None
+    azure_document_intelligence: ProviderExtractionEnvelope | None = None
