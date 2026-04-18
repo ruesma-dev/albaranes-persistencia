@@ -225,6 +225,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             if envelope.gemini is not None and isinstance(envelope.gemini.debug, dict)
             else {}
         )
+        claude_debug = (
+            envelope.claude.debug
+            if envelope.claude is not None and isinstance(envelope.claude.debug, dict)
+            else {}
+        )
         google_debug = (
             envelope.google_document_ai.debug
             if envelope.google_document_ai is not None
@@ -241,14 +246,19 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         merge_analysis = self._confidence_service.build_merge_analysis(
             openai=envelope,
             gemini=envelope.gemini,
+            claude=envelope.claude,
         )
 
         raw_provider_specs: list[RawProviderSpec] = [
             RawProviderSpec(
                 provider_origin="openai",
                 provider_envelope=envelope,
-                ia_input_payload=self._coerce_dict(openai_debug.get("openai_request")),
-                ia_output_payload=self._coerce_dict(openai_debug.get("openai_response")),
+                ia_input_payload=self._coerce_dict(
+                    openai_debug.get("openai_request")
+                ),
+                ia_output_payload=self._coerce_dict(
+                    openai_debug.get("openai_response")
+                ),
                 ia_input_relative_path=stored_file.ia_input_relative_path,
                 ia_input_web_url=stored_file.ia_input_web_url,
                 ia_output_relative_path=stored_file.ia_output_relative_path,
@@ -261,14 +271,38 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 RawProviderSpec(
                     provider_origin="gemini",
                     provider_envelope=envelope.gemini,
-                    ia_input_payload=self._coerce_dict(gemini_debug.get("gemini_request")),
-                    ia_output_payload=self._coerce_dict(gemini_debug.get("gemini_response")),
+                    ia_input_payload=self._coerce_dict(
+                        gemini_debug.get("gemini_request")
+                    ),
+                    ia_output_payload=self._coerce_dict(
+                        gemini_debug.get("gemini_response")
+                    ),
                     ia_input_relative_path=stored_file.gem_input_relative_path,
                     ia_input_web_url=stored_file.gem_input_web_url,
                     ia_output_relative_path=stored_file.gem_output_relative_path,
                     ia_output_web_url=stored_file.gem_output_web_url,
                     document_confidence_pct=self._average_confidence(
                         envelope.gemini.data.lineas
+                    ),
+                )
+            )
+        if envelope.claude is not None:
+            raw_provider_specs.append(
+                RawProviderSpec(
+                    provider_origin="claude",
+                    provider_envelope=envelope.claude,
+                    ia_input_payload=self._coerce_dict(
+                        claude_debug.get("claude_request")
+                    ),
+                    ia_output_payload=self._coerce_dict(
+                        claude_debug.get("claude_response")
+                    ),
+                    ia_input_relative_path=stored_file.cla_input_relative_path,
+                    ia_input_web_url=stored_file.cla_input_web_url,
+                    ia_output_relative_path=stored_file.cla_output_relative_path,
+                    ia_output_web_url=stored_file.cla_output_web_url,
+                    document_confidence_pct=self._average_confidence(
+                        envelope.claude.data.lineas
                     ),
                 )
             )
@@ -340,7 +374,33 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             for provider_spec in raw_provider_specs
         ]
 
-        merge_debug = gemini_debug if envelope.gemini is not None else openai_debug
+        # Debug que se guarda asociado al merge: priorizamos gemini, luego claude,
+        # luego openai (mismo orden de precedencia que el merge).
+        if envelope.gemini is not None:
+            merge_debug = gemini_debug
+            merge_input_rel = stored_file.gem_input_relative_path
+            merge_input_url = stored_file.gem_input_web_url
+            merge_output_rel = stored_file.gem_output_relative_path
+            merge_output_url = stored_file.gem_output_web_url
+            merge_input_key = "gemini_request"
+            merge_output_key = "gemini_response"
+        elif envelope.claude is not None:
+            merge_debug = claude_debug
+            merge_input_rel = stored_file.cla_input_relative_path
+            merge_input_url = stored_file.cla_input_web_url
+            merge_output_rel = stored_file.cla_output_relative_path
+            merge_output_url = stored_file.cla_output_web_url
+            merge_input_key = "claude_request"
+            merge_output_key = "claude_response"
+        else:
+            merge_debug = openai_debug
+            merge_input_rel = stored_file.ia_input_relative_path
+            merge_input_url = stored_file.ia_input_web_url
+            merge_output_rel = stored_file.ia_output_relative_path
+            merge_output_url = stored_file.ia_output_web_url
+            merge_input_key = "openai_request"
+            merge_output_key = "openai_response"
+
         merge_document_id = str(uuid.uuid4())
         merge_document = self._build_document_orm(
             orm_document_cls=AlbaranDocumentMergeOrm,
@@ -352,32 +412,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             email_ctx=email_ctx,
             document_ctx=document_ctx,
             stored_file=stored_file,
-            ia_input_payload=self._coerce_dict(
-                merge_debug.get("gemini_request") or merge_debug.get("openai_request")
-            ),
-            ia_output_payload=self._coerce_dict(
-                merge_debug.get("gemini_response") or merge_debug.get("openai_response")
-            ),
-            ia_input_relative_path=(
-                stored_file.gem_input_relative_path
-                if envelope.gemini is not None
-                else stored_file.ia_input_relative_path
-            ),
-            ia_input_web_url=(
-                stored_file.gem_input_web_url
-                if envelope.gemini is not None
-                else stored_file.ia_input_web_url
-            ),
-            ia_output_relative_path=(
-                stored_file.gem_output_relative_path
-                if envelope.gemini is not None
-                else stored_file.ia_output_relative_path
-            ),
-            ia_output_web_url=(
-                stored_file.gem_output_web_url
-                if envelope.gemini is not None
-                else stored_file.ia_output_web_url
-            ),
+            ia_input_payload=self._coerce_dict(merge_debug.get(merge_input_key)),
+            ia_output_payload=self._coerce_dict(merge_debug.get(merge_output_key)),
+            ia_input_relative_path=merge_input_rel,
+            ia_input_web_url=merge_input_url,
+            ia_output_relative_path=merge_output_rel,
+            ia_output_web_url=merge_output_url,
             raw_lines=[item.merged_line for item in merge_analysis.line_results],
             document_confidence_pct=merge_analysis.document_confidence_pct,
             review_required=merge_analysis.review_required,
@@ -435,7 +475,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
 
     @staticmethod
     def _average_confidence(lines: list[LineaAlbaran]) -> float | None:
-        values = [float(line.confianza_pct) for line in lines if line.confianza_pct is not None]
+        values = [
+            float(line.confianza_pct)
+            for line in lines
+            if line.confianza_pct is not None
+        ]
         if not values:
             return None
         return round(sum(values) / len(values), 2)

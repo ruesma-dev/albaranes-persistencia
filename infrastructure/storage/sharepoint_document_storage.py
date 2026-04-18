@@ -29,6 +29,18 @@ class ResolvedFolder:
     folder_name: str | None
 
 
+@dataclass(frozen=True)
+class _ArtifactSpec:
+    """Descriptor del artefacto JSON que subimos junto al fichero original."""
+
+    payload: dict[str, Any] | None
+    request_type: str
+    response_type: str
+
+    # Ayudas para que el llamador distinga si es request o response.
+    is_request: bool = True
+
+
 class SharePointDocumentStorage(DocumentStorage):
     def __init__(
         self,
@@ -428,6 +440,8 @@ class SharePointDocumentStorage(DocumentStorage):
         path = PurePosixPath(final_name)
         if artifact_type.startswith("gemini_"):
             return f"{path.stem}.{artifact_type}_GEM.json"
+        if artifact_type.startswith("claude_"):
+            return f"{path.stem}.{artifact_type}_CLA.json"
         return f"{path.stem}.{artifact_type}.json"
 
     @staticmethod
@@ -479,6 +493,8 @@ class SharePointDocumentStorage(DocumentStorage):
         ia_output_payload: dict[str, Any] | None = None,
         gem_input_payload: dict[str, Any] | None = None,
         gem_output_payload: dict[str, Any] | None = None,
+        cla_input_payload: dict[str, Any] | None = None,
+        cla_output_payload: dict[str, Any] | None = None,
     ) -> StoredFile:
         ia_input_relative_path: str | None = None
         ia_input_web_url: str | None = None
@@ -488,6 +504,10 @@ class SharePointDocumentStorage(DocumentStorage):
         gem_input_web_url: str | None = None
         gem_output_relative_path: str | None = None
         gem_output_web_url: str | None = None
+        cla_input_relative_path: str | None = None
+        cla_input_web_url: str | None = None
+        cla_output_relative_path: str | None = None
+        cla_output_web_url: str | None = None
 
         if self._mode == "drive_id":
             assert self._drive_id is not None
@@ -562,6 +582,28 @@ class SharePointDocumentStorage(DocumentStorage):
                     artifact_name=self._artifact_name(final_name, "gemini_response"),
                     payload=gem_output_payload,
                 )
+            if cla_input_payload:
+                cla_input_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "claude_request")
+                )
+                _, cla_input_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "claude_request"),
+                    payload=cla_input_payload,
+                )
+            if cla_output_payload:
+                cla_output_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "claude_response")
+                )
+                _, cla_output_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "claude_response"),
+                    payload=cla_output_payload,
+                )
 
         elif self._mode == "folder_url":
             base_folder = self._resolve_folder_from_share_url()
@@ -632,6 +674,28 @@ class SharePointDocumentStorage(DocumentStorage):
                     artifact_name=self._artifact_name(final_name, "gemini_response"),
                     payload=gem_output_payload,
                 )
+            if cla_input_payload:
+                cla_input_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "claude_request")
+                )
+                _, cla_input_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "claude_request"),
+                    payload=cla_input_payload,
+                )
+            if cla_output_payload:
+                cla_output_relative_path = str(
+                    PurePosixPath(relative_path).parent
+                    / self._artifact_name(final_name, "claude_response")
+                )
+                _, cla_output_web_url = self._upload_artifact_by_parent(
+                    drive_id=drive_id,
+                    parent_item_id=parent_id,
+                    artifact_name=self._artifact_name(final_name, "claude_response"),
+                    payload=cla_output_payload,
+                )
 
         else:
             site_id = self._resolve_site_id()
@@ -684,6 +748,24 @@ class SharePointDocumentStorage(DocumentStorage):
                         payload=gem_output_payload,
                     )
                 )
+            if cla_input_payload:
+                cla_input_relative_path, cla_input_web_url = (
+                    self._upload_artifact_by_relative_path(
+                        drive_id=drive_id,
+                        relative_dir=relative_dir,
+                        artifact_name=self._artifact_name(final_name, "claude_request"),
+                        payload=cla_input_payload,
+                    )
+                )
+            if cla_output_payload:
+                cla_output_relative_path, cla_output_web_url = (
+                    self._upload_artifact_by_relative_path(
+                        drive_id=drive_id,
+                        relative_dir=relative_dir,
+                        artifact_name=self._artifact_name(final_name, "claude_response"),
+                        payload=cla_output_payload,
+                    )
+                )
 
         item_id = str(uploaded.get("id") or "").strip()
         if not item_id:
@@ -711,4 +793,8 @@ class SharePointDocumentStorage(DocumentStorage):
             gem_input_web_url=gem_input_web_url,
             gem_output_relative_path=gem_output_relative_path,
             gem_output_web_url=gem_output_web_url,
+            cla_input_relative_path=cla_input_relative_path,
+            cla_input_web_url=cla_input_web_url,
+            cla_output_relative_path=cla_output_relative_path,
+            cla_output_web_url=cla_output_web_url,
         )

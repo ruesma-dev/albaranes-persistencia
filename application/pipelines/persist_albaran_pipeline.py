@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from application.services.albaran_normalizer import AlbaranNormalizer
-from domain.models.extraction_models import ExtractionEnvelope, ProviderExtractionEnvelope
+from domain.models.extraction_models import (
+    ExtractionEnvelope,
+    ProviderExtractionEnvelope,
+)
 from domain.ports.albaran_repository import AlbaranRepository
 from domain.ports.document_storage import DocumentStorage
 
@@ -68,10 +71,17 @@ class PersistAlbaranPipeline:
             )
 
         envelope = self._normalize(envelope)
-        openai_debug = envelope.debug if isinstance(envelope.debug, dict) else {}
+        openai_debug = (
+            envelope.debug if isinstance(envelope.debug, dict) else {}
+        )
         gemini_debug = (
             envelope.gemini.debug
             if envelope.gemini is not None and isinstance(envelope.gemini.debug, dict)
+            else {}
+        )
+        claude_debug = (
+            envelope.claude.debug
+            if envelope.claude is not None and isinstance(envelope.claude.debug, dict)
             else {}
         )
 
@@ -80,10 +90,24 @@ class PersistAlbaranPipeline:
             mime_type=request.mime_type,
             file_bytes=request.file_bytes,
             source_sha256=sha256,
-            ia_input_payload=self._coerce_dict(openai_debug.get("openai_request")),
-            ia_output_payload=self._coerce_dict(openai_debug.get("openai_response")),
-            gem_input_payload=self._coerce_dict(gemini_debug.get("gemini_request")),
-            gem_output_payload=self._coerce_dict(gemini_debug.get("gemini_response")),
+            ia_input_payload=self._coerce_dict(
+                openai_debug.get("openai_request")
+            ),
+            ia_output_payload=self._coerce_dict(
+                openai_debug.get("openai_response")
+            ),
+            gem_input_payload=self._coerce_dict(
+                gemini_debug.get("gemini_request")
+            ),
+            gem_output_payload=self._coerce_dict(
+                gemini_debug.get("gemini_response")
+            ),
+            cla_input_payload=self._coerce_dict(
+                claude_debug.get("claude_request")
+            ),
+            cla_output_payload=self._coerce_dict(
+                claude_debug.get("claude_response")
+            ),
         )
         saved = self._repository.save(
             envelope=envelope,
@@ -98,15 +122,29 @@ class PersistAlbaranPipeline:
             stored_lines=saved.stored_lines,
         )
 
-    def _validate_sha256(self, *, envelope: ExtractionEnvelope, sha256: str) -> None:
-        providers: list[tuple[str, ProviderExtractionEnvelope]] = [("openai", envelope)]
+    def _validate_sha256(
+        self,
+        *,
+        envelope: ExtractionEnvelope,
+        sha256: str,
+    ) -> None:
+        providers: list[tuple[str, ProviderExtractionEnvelope]] = [
+            ("openai", envelope)
+        ]
         if envelope.gemini is not None:
             providers.append(("gemini", envelope.gemini))
+        if envelope.claude is not None:
+            providers.append(("claude", envelope.claude))
         if envelope.google_document_ai is not None:
-            providers.append(("google_document_ai", envelope.google_document_ai))
+            providers.append(
+                ("google_document_ai", envelope.google_document_ai)
+            )
         if envelope.azure_document_intelligence is not None:
             providers.append(
-                ("azure_document_intelligence", envelope.azure_document_intelligence)
+                (
+                    "azure_document_intelligence",
+                    envelope.azure_document_intelligence,
+                )
             )
 
         for provider_name, provider_envelope in providers:
@@ -130,6 +168,7 @@ class PersistAlbaranPipeline:
         provider_updates: dict[str, ProviderExtractionEnvelope] = {}
         optional_providers = {
             "gemini": normalized.gemini,
+            "claude": normalized.claude,
             "google_document_ai": normalized.google_document_ai,
             "azure_document_intelligence": normalized.azure_document_intelligence,
         }

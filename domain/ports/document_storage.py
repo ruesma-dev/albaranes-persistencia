@@ -20,5 +20,7 @@ class DocumentStorage(ABC):
         ia_output_payload: dict[str, Any] | None = None,
         gem_input_payload: dict[str, Any] | None = None,
         gem_output_payload: dict[str, Any] | None = None,
+        cla_input_payload: dict[str, Any] | None = None,
+        cla_output_payload: dict[str, Any] | None = None,
     ) -> StoredFile:
         raise NotImplementedError

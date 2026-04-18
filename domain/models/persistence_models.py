@@ -1,4 +1,4 @@
-# albaranes_persistence/domain/models/persistence_models.py
+# domain/models/persistence_models.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +19,10 @@ class StoredFile:
     gem_input_web_url: str | None = None
     gem_output_relative_path: str | None = None
     gem_output_web_url: str | None = None
+    cla_input_relative_path: str | None = None
+    cla_input_web_url: str | None = None
+    cla_output_relative_path: str | None = None
+    cla_output_web_url: str | None = None
 
     @property
     def openai_input_relative_path(self) -> str | None:
@@ -51,6 +55,22 @@ class StoredFile:
     @property
     def gemini_output_web_url(self) -> str | None:
         return self.gem_output_web_url
+
+    @property
+    def claude_input_relative_path(self) -> str | None:
+        return self.cla_input_relative_path
+
+    @property
+    def claude_input_web_url(self) -> str | None:
+        return self.cla_input_web_url
+
+    @property
+    def claude_output_relative_path(self) -> str | None:
+        return self.cla_output_relative_path
+
+    @property
+    def claude_output_web_url(self) -> str | None:
+        return self.cla_output_web_url
 
 
 @dataclass(frozen=True)
