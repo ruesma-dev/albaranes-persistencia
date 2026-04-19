@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Type
@@ -29,6 +30,8 @@ from infrastructure.database.orm_models import (
     Base,
 )
 from infrastructure.database.session_factory import SessionFactory
+
+logger = logging.getLogger(__name__)
 
 DocumentOrmType = Type[AlbaranDocumentOrm] | Type[AlbaranDocumentMergeOrm]
 LineOrmType = Type[AlbaranLineOrm] | Type[AlbaranLineMergeOrm]
@@ -449,6 +452,68 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             sharepoint_url=stored_file.share_url or stored_file.web_url,
             stored_lines=len(merge_analysis.line_results),
         )
+
+    # ------------------------------------------------------------------ #
+    # Métodos usados por el step de enriquecimiento (ObraEnrichmentService).
+    # El repositorio cumple el puerto ObraMergeRepository por duck-typing.
+    # ------------------------------------------------------------------ #
+    def get_merge_obra_codigo(self, *, document_id: str) -> str | None:
+        """Lee obra_codigo del registro merge. Devuelve None si no existe."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                logger.warning(
+                    "[obra-enrichment][repo] get_merge_obra_codigo: "
+                    "documento merge NO encontrado. document_id=%s",
+                    document_id,
+                )
+                return None
+            logger.info(
+                "[obra-enrichment][repo] get_merge_obra_codigo: "
+                "document_id=%s obra_codigo=%r",
+                document_id,
+                document.obra_codigo,
+            )
+            return document.obra_codigo
+
+    def update_merge_obra_fields(
+        self,
+        *,
+        document_id: str,
+        obra_nombre: str | None,
+        obra_direccion: str | None,
+    ) -> None:
+        """Sobrescribe obra_nombre y obra_direccion en el merge.
+
+        Solo toca esos dos campos. No modifica reviewed_at_utc ni otros
+        timestamps porque no es una edición humana, es enriquecimiento
+        automático.
+        """
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                raise KeyError(
+                    f"Documento merge no encontrado: {document_id}"
+                )
+            logger.info(
+                "[obra-enrichment][repo] update_merge_obra_fields: "
+                "document_id=%s ANTES obra_nombre=%r obra_direccion=%r",
+                document_id,
+                document.obra_nombre,
+                document.obra_direccion,
+            )
+            document.obra_nombre = obra_nombre
+            document.obra_direccion = obra_direccion
+            session.commit()
+            logger.info(
+                "[obra-enrichment][repo] update_merge_obra_fields: "
+                "document_id=%s DESPUÉS obra_nombre=%r obra_direccion=%r (committed)",
+                document_id,
+                obra_nombre,
+                obra_direccion,
+            )
 
     def _delete_existing_records(self, *, session: Any, source_sha256: str) -> None:
         merge_docs = session.scalars(

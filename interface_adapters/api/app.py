@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict
 from typing import Any, Dict
 
@@ -12,14 +13,18 @@ from application.pipelines.persist_albaran_pipeline import (
     PersistAlbaranRequest,
 )
 from application.services.albaran_normalizer import AlbaranNormalizer
+from application.services.obra_enrichment_service import ObraEnrichmentService
 from config.settings import Settings
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
 )
+from infrastructure.sigrid.sigrid_api_obra_client import SigridApiObraClient
 from infrastructure.storage.sharepoint_document_storage import (
     SharePointDocumentStorage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def build_app(settings: Settings) -> FastAPI:
@@ -45,10 +50,50 @@ def build_app(settings: Settings) -> FastAPI:
         link_scope=settings.sharepoint_link_scope,
         create_link=settings.sharepoint_create_link,
     )
+
+    # ------------------------------------------------------------------ #
+    # Construcción del servicio de enriquecimiento de obra (Sigrid on-prem).
+    # Si faltan credenciales en .env, queda como None y el pipeline lo salta.
+    # ------------------------------------------------------------------ #
+    obra_enrichment_service: ObraEnrichmentService | None = None
+    logger.info(
+        "[obra-enrichment][wiring] obra_enrichment_enabled=%s "
+        "sigrid_api_configured=%s base_url=%s database=%s",
+        settings.obra_enrichment_enabled,
+        settings.sigrid_api_configured,
+        settings.sigrid_api_base_url,
+        settings.sigrid_api_database,
+    )
+    if settings.obra_enrichment_enabled and settings.sigrid_api_configured:
+        sigrid_client = SigridApiObraClient(
+            base_url=settings.sigrid_api_base_url,
+            function_key=settings.sigrid_api_function_key,
+            database=settings.sigrid_api_database,
+            timeout_s=settings.sigrid_api_timeout_s,
+        )
+        obra_enrichment_service = ObraEnrichmentService(
+            client=sigrid_client,
+            repository=repository,
+            enabled=True,
+        )
+        logger.info(
+            "[obra-enrichment][wiring] ObraEnrichmentService CREADO y listo."
+        )
+    else:
+        logger.warning(
+            "[obra-enrichment][wiring] NO se crea ObraEnrichmentService. "
+            "Motivo: enabled=%s configured=%s. "
+            "Revisa SIGRID_API_BASE_URL / SIGRID_API_FUNCTION_KEY / SIGRID_API_DATABASE / "
+            "OBRA_ENRICHMENT_ENABLED en tu .env.",
+            settings.obra_enrichment_enabled,
+            settings.sigrid_api_configured,
+        )
+
     pipeline = PersistAlbaranPipeline(
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
+        obra_enrichment_service=obra_enrichment_service,
     )
 
     app = FastAPI(
@@ -69,6 +114,10 @@ def build_app(settings: Settings) -> FastAPI:
             "sharepoint_folder_root": settings.sharepoint_folder_root,
             "sharepoint_folder_url": settings.sharepoint_folder_url,
             "sharepoint_site_path": settings.sharepoint_site_path,
+            "obra_enrichment_enabled": settings.obra_enrichment_enabled,
+            "obra_enrichment_wired": obra_enrichment_service is not None,
+            "sigrid_api_base_url": settings.sigrid_api_base_url,
+            "sigrid_api_database": settings.sigrid_api_database,
         }
 
     @app.post("/v1/albaranes/persist")

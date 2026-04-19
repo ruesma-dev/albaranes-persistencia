@@ -77,6 +77,30 @@ class Settings(BaseSettings):
     log_dir: str = Field("logs", alias="LOG_DIR")
     service_version: str = Field("1.0.0", alias="SERVICE_VERSION")
 
+    # ------------------------------------------------------------------ #
+    # Sigrid API — enriquecimiento de obra desde BBDD on-prem (Function)
+    # ------------------------------------------------------------------ #
+    sigrid_api_base_url: str | None = Field(
+        default=None,
+        alias="SIGRID_API_BASE_URL",
+    )
+    sigrid_api_function_key: str | None = Field(
+        default=None,
+        alias="SIGRID_API_FUNCTION_KEY",
+    )
+    sigrid_api_database: str = Field(
+        "ruesma",
+        alias="SIGRID_API_DATABASE",
+    )
+    sigrid_api_timeout_s: float = Field(
+        30.0,
+        alias="SIGRID_API_TIMEOUT_S",
+    )
+    obra_enrichment_enabled: bool = Field(
+        True,
+        alias="OBRA_ENRICHMENT_ENABLED",
+    )
+
     model_config = SettingsConfigDict(
         env_file=_ENV_FILE,
         env_file_encoding="utf-8",
@@ -132,4 +156,13 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{user}:{password}"
             f"@{self.pg_host}:{self.pg_port}/{database}"
+        )
+
+    @property
+    def sigrid_api_configured(self) -> bool:
+        """True si podemos construir el cliente Sigrid sin datos a medias."""
+        return bool(
+            (self.sigrid_api_base_url or "").strip()
+            and (self.sigrid_api_function_key or "").strip()
+            and (self.sigrid_api_database or "").strip()
         )

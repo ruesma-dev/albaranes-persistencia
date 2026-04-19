@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from application.services.albaran_normalizer import AlbaranNormalizer
+from application.services.obra_enrichment_service import ObraEnrichmentService
 from domain.models.extraction_models import (
     ExtractionEnvelope,
     ProviderExtractionEnvelope,
@@ -42,10 +43,17 @@ class PersistAlbaranPipeline:
         repository: AlbaranRepository,
         document_storage: DocumentStorage,
         normalizer: AlbaranNormalizer,
+        obra_enrichment_service: ObraEnrichmentService | None = None,
     ) -> None:
         self._repository = repository
         self._document_storage = document_storage
         self._normalizer = normalizer
+        self._obra_enrichment_service = obra_enrichment_service
+        logger.info(
+            "[obra-enrichment][pipeline] PersistAlbaranPipeline construido; "
+            "enrichment_service=%s",
+            "PRESENTE" if obra_enrichment_service is not None else "None",
+        )
 
     def run(self, request: PersistAlbaranRequest) -> PersistAlbaranResult:
         if not request.file_bytes:
@@ -62,6 +70,10 @@ class PersistAlbaranPipeline:
                 sha256,
                 existing.document_id,
             )
+            # Idempotencia: si ya existía y ahora Sigrid responde, también
+            # enriquecemos. Evita que reintentos sobre el mismo fichero
+            # sigan mostrando datos antiguos si la BBDD cambió.
+            self._enrich_safely(merge_document_id=existing.document_id)
             return PersistAlbaranResult(
                 ok=True,
                 document_id=existing.document_id,
@@ -114,6 +126,13 @@ class PersistAlbaranPipeline:
             context=request.context,
             stored_file=stored_file,
         )
+
+        # Step final: enriquecer obra_nombre / obra_direccion desde Sigrid (on-prem).
+        # Esto sobrescribe los valores del merge recién persistido si la BBDD
+        # Ruesma tiene la obra. Es best-effort: cualquier fallo queda en logs
+        # y no propaga excepción al cliente HTTP.
+        self._enrich_safely(merge_document_id=saved.document_id)
+
         return PersistAlbaranResult(
             ok=True,
             document_id=saved.document_id,
@@ -121,6 +140,30 @@ class PersistAlbaranPipeline:
             duplicate=False,
             stored_lines=saved.stored_lines,
         )
+
+    def _enrich_safely(self, *, merge_document_id: str) -> None:
+        """Llama al servicio de enriquecimiento capturando cualquier excepción."""
+        logger.info(
+            "[obra-enrichment][pipeline] pre-step: service_present=%s "
+            "merge_document_id=%s",
+            self._obra_enrichment_service is not None,
+            merge_document_id,
+        )
+        if self._obra_enrichment_service is None:
+            logger.warning(
+                "[obra-enrichment][pipeline] SKIP: no hay servicio wire-ado. "
+                "Revisa SIGRID_API_* en .env y obra_enrichment_service en build_app()."
+            )
+            return
+        try:
+            self._obra_enrichment_service.enrich_merge_document(
+                merge_document_id=merge_document_id,
+            )
+        except Exception:
+            logger.exception(
+                "[obra-enrichment][pipeline] step falló; se continúa. document_id=%s",
+                merge_document_id,
+            )
 
     def _validate_sha256(
         self,
