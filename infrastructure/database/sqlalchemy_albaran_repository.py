@@ -5,15 +5,17 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Type
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from application.services.albaran_confidence_service import (
     AlbaranConfidenceService,
     LineMergeResult,
 )
+from domain.models.contrato_models import ContratoEnrichmentResult
 from domain.models.extraction_models import (
     CabeceraAlbaran,
     ExtractionEnvelope,
@@ -22,6 +24,9 @@ from domain.models.extraction_models import (
 )
 from domain.models.persistence_models import ExistingDocument, StoredFile
 from domain.ports.albaran_repository import AlbaranRepository
+# Importar orm_contrato_models registra AlbaranContratoMergeOrm con Base.metadata
+# para que create_all la descubra. NO mover este import.
+from infrastructure.database.orm_contrato_models import AlbaranContratoMergeOrm
 from infrastructure.database.orm_models import (
     AlbaranDocumentMergeOrm,
     AlbaranDocumentOrm,
@@ -156,6 +161,15 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 ]
             )
 
+        # Columna nueva: contrato seleccionado por el usuario (o auto-
+        # seleccionado si solo hay 1). Referencia soft (string, no FK):
+        # si el enrichment borra/recrea contratos por código, la selección
+        # sigue siendo válida mientras ese código exista.
+        alter_statements.append(
+            "ALTER TABLE albaran_documents_merge "
+            "ADD COLUMN IF NOT EXISTS selected_contrato_codigo VARCHAR(64)"
+        )
+
         constraint_statements = [
             (
                 "ALTER TABLE albaran_documents "
@@ -172,6 +186,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             (
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_albaran_documents_sha_provider "
                 "ON albaran_documents (source_sha256, provider_origin)"
+            ),
+            # Índice para las búsquedas de contratos por documento.
+            (
+                "CREATE INDEX IF NOT EXISTS ix_albaran_contratos_merge_document "
+                "ON albaran_contratos_merge (document_id)"
             ),
         ]
 
@@ -377,8 +396,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             for provider_spec in raw_provider_specs
         ]
 
-        # Debug que se guarda asociado al merge: priorizamos gemini, luego claude,
-        # luego openai (mismo orden de precedencia que el merge).
         if envelope.gemini is not None:
             merge_debug = gemini_debug
             merge_input_rel = stored_file.gem_input_relative_path
@@ -453,12 +470,10 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             stored_lines=len(merge_analysis.line_results),
         )
 
-    # ------------------------------------------------------------------ #
-    # Métodos usados por el step de enriquecimiento (ObraEnrichmentService).
-    # El repositorio cumple el puerto ObraMergeRepository por duck-typing.
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # Puerto ObraMergeRepository (cumplido por duck-typing)
+    # ================================================================== #
     def get_merge_obra_codigo(self, *, document_id: str) -> str | None:
-        """Lee obra_codigo del registro merge. Devuelve None si no existe."""
         self.initialize()
         with self._session_factory.create_session() as session:
             document = session.get(AlbaranDocumentMergeOrm, document_id)
@@ -484,19 +499,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         obra_nombre: str | None,
         obra_direccion: str | None,
     ) -> None:
-        """Sobrescribe obra_nombre y obra_direccion en el merge.
-
-        Solo toca esos dos campos. No modifica reviewed_at_utc ni otros
-        timestamps porque no es una edición humana, es enriquecimiento
-        automático.
-        """
         self.initialize()
         with self._session_factory.create_session() as session:
             document = session.get(AlbaranDocumentMergeOrm, document_id)
             if document is None:
-                raise KeyError(
-                    f"Documento merge no encontrado: {document_id}"
-                )
+                raise KeyError(f"Documento merge no encontrado: {document_id}")
             logger.info(
                 "[obra-enrichment][repo] update_merge_obra_fields: "
                 "document_id=%s ANTES obra_nombre=%r obra_direccion=%r",
@@ -515,6 +522,110 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 obra_direccion,
             )
 
+    # ================================================================== #
+    # Puerto ContratoMergeRepository (cumplido por duck-typing)
+    # ================================================================== #
+    def get_merge_cif_and_obra(
+        self,
+        *,
+        document_id: str,
+    ) -> tuple[str | None, str | None]:
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                logger.warning(
+                    "[contrato-enrichment][repo] get_merge_cif_and_obra: "
+                    "documento merge NO encontrado. document_id=%s",
+                    document_id,
+                )
+                return None, None
+            logger.info(
+                "[contrato-enrichment][repo] get_merge_cif_and_obra: "
+                "document_id=%s cif=%r obra=%r",
+                document_id,
+                document.proveedor_cif,
+                document.obra_codigo,
+            )
+            return document.proveedor_cif, document.obra_codigo
+
+    def replace_contratos(
+        self,
+        *,
+        document_id: str,
+        contratos: list[ContratoEnrichmentResult],
+    ) -> None:
+        self.initialize()
+        now = datetime.now(timezone.utc).isoformat()
+        with self._session_factory.create_session() as session:
+            # Asegurar que el merge existe para no crear contratos huérfanos.
+            merge_doc = session.get(AlbaranDocumentMergeOrm, document_id)
+            if merge_doc is None:
+                raise KeyError(f"Documento merge no encontrado: {document_id}")
+
+            # Borrado idempotente de los contratos previos.
+            deleted = session.execute(
+                delete(AlbaranContratoMergeOrm).where(
+                    AlbaranContratoMergeOrm.document_id == document_id
+                )
+            )
+            session.flush()
+
+            for contrato in contratos:
+                session.add(
+                    AlbaranContratoMergeOrm(
+                        document_id=document_id,
+                        codigo_contrato=contrato.codigo_contrato,
+                        nombre_contrato=contrato.nombre_contrato,
+                        fecha_alta_contrato=contrato.fecha_alta_contrato,
+                        fecha_contrato=contrato.fecha_contrato,
+                        vigencia_desde=contrato.vigencia_desde,
+                        vigencia_hasta=contrato.vigencia_hasta,
+                        importe_total=contrato.importe_total,
+                        cif_proveedor=contrato.cif_proveedor,
+                        nombre_proveedor=contrato.nombre_proveedor,
+                        codigo_obra=contrato.codigo_obra,
+                        nombre_obra=contrato.nombre_obra,
+                        fetched_at_utc=now,
+                    )
+                )
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] replace_contratos: "
+                "document_id=%s borrados=%s insertados=%s",
+                document_id,
+                deleted.rowcount if hasattr(deleted, "rowcount") else "?",
+                len(contratos),
+            )
+
+    def set_selected_contrato(
+        self,
+        *,
+        document_id: str,
+        codigo_contrato: str | None,
+    ) -> None:
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            # Usamos UPDATE crudo porque la columna selected_contrato_codigo
+            # no está declarada en el ORM de AlbaranDocumentMergeOrm (lo cual
+            # evita forzar al usuario a modificar ese archivo). Sí existe en
+            # BBDD por la migración de _ensure_compatible_schema.
+            session.execute(
+                text(
+                    "UPDATE albaran_documents_merge "
+                    "SET selected_contrato_codigo = :codigo "
+                    "WHERE id = :doc_id"
+                ),
+                {"codigo": codigo_contrato, "doc_id": document_id},
+            )
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] set_selected_contrato: "
+                "document_id=%s codigo_contrato=%r",
+                document_id,
+                codigo_contrato,
+            )
+
     def _delete_existing_records(self, *, session: Any, source_sha256: str) -> None:
         merge_docs = session.scalars(
             select(AlbaranDocumentMergeOrm).where(
@@ -522,6 +633,13 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
         ).all()
         for document in merge_docs:
+            # Los contratos se eliminan por FK ON DELETE CASCADE; aun así,
+            # por si la FK no se creó en esquemas antiguos, borramos manual.
+            session.execute(
+                delete(AlbaranContratoMergeOrm).where(
+                    AlbaranContratoMergeOrm.document_id == document.id
+                )
+            )
             session.delete(document)
 
         raw_docs = session.scalars(

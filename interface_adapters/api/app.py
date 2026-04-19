@@ -13,11 +13,17 @@ from application.pipelines.persist_albaran_pipeline import (
     PersistAlbaranRequest,
 )
 from application.services.albaran_normalizer import AlbaranNormalizer
+from application.services.contrato_enrichment_service import (
+    ContratoEnrichmentService,
+)
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from config.settings import Settings
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
+)
+from infrastructure.sigrid.sigrid_api_contrato_client import (
+    SigridApiContratoClient,
 )
 from infrastructure.sigrid.sigrid_api_obra_client import SigridApiObraClient
 from infrastructure.storage.sharepoint_document_storage import (
@@ -89,11 +95,55 @@ def build_app(settings: Settings) -> FastAPI:
             settings.sigrid_api_configured,
         )
 
+    # ------------------------------------------------------------------ #
+    # Construcción del servicio de enriquecimiento de CONTRATOS (nuevo).
+    # Reutiliza las mismas credenciales Sigrid que el enrichment de obra.
+    # Flag independiente: si en el futuro quieres apagar SOLO el de
+    # contratos sin tocar el de obra, añade CONTRATO_ENRICHMENT_ENABLED
+    # al .env y al Settings. El getattr asegura compatibilidad hacia atrás
+    # si ese campo aún no existe en Settings (se considera activado).
+    # ------------------------------------------------------------------ #
+    contrato_enrichment_service: ContratoEnrichmentService | None = None
+    contrato_enabled_flag = getattr(
+        settings, "contrato_enrichment_enabled", True
+    )
+    logger.info(
+        "[contrato-enrichment][wiring] contrato_enrichment_enabled=%s "
+        "sigrid_api_configured=%s base_url=%s database=%s",
+        contrato_enabled_flag,
+        settings.sigrid_api_configured,
+        settings.sigrid_api_base_url,
+        settings.sigrid_api_database,
+    )
+    if contrato_enabled_flag and settings.sigrid_api_configured:
+        contrato_client = SigridApiContratoClient(
+            base_url=settings.sigrid_api_base_url,
+            function_key=settings.sigrid_api_function_key,
+            database=settings.sigrid_api_database,
+            timeout_s=settings.sigrid_api_timeout_s,
+        )
+        contrato_enrichment_service = ContratoEnrichmentService(
+            client=contrato_client,
+            repository=repository,
+            enabled=True,
+        )
+        logger.info(
+            "[contrato-enrichment][wiring] ContratoEnrichmentService CREADO y listo."
+        )
+    else:
+        logger.warning(
+            "[contrato-enrichment][wiring] NO se crea ContratoEnrichmentService. "
+            "Motivo: enabled=%s configured=%s.",
+            contrato_enabled_flag,
+            settings.sigrid_api_configured,
+        )
+
     pipeline = PersistAlbaranPipeline(
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
         obra_enrichment_service=obra_enrichment_service,
+        contrato_enrichment_service=contrato_enrichment_service,
     )
 
     app = FastAPI(
@@ -116,6 +166,8 @@ def build_app(settings: Settings) -> FastAPI:
             "sharepoint_site_path": settings.sharepoint_site_path,
             "obra_enrichment_enabled": settings.obra_enrichment_enabled,
             "obra_enrichment_wired": obra_enrichment_service is not None,
+            "contrato_enrichment_enabled": contrato_enabled_flag,
+            "contrato_enrichment_wired": contrato_enrichment_service is not None,
             "sigrid_api_base_url": settings.sigrid_api_base_url,
             "sigrid_api_database": settings.sigrid_api_database,
         }
