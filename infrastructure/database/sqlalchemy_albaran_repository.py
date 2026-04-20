@@ -24,9 +24,13 @@ from domain.models.extraction_models import (
 )
 from domain.models.persistence_models import ExistingDocument, StoredFile
 from domain.ports.albaran_repository import AlbaranRepository
-# Importar orm_contrato_models registra AlbaranContratoMergeOrm con Base.metadata
-# para que create_all la descubra. NO mover este import.
-from infrastructure.database.orm_contrato_models import AlbaranContratoMergeOrm
+# Importar orm_contrato_models registra AlbaranContratoMergeOrm y
+# AlbaranContratoLineMergeOrm con Base.metadata para que create_all las
+# descubra. NO mover este import.
+from infrastructure.database.orm_contrato_models import (
+    AlbaranContratoLineMergeOrm,
+    AlbaranContratoMergeOrm,
+)
 from infrastructure.database.orm_models import (
     AlbaranDocumentMergeOrm,
     AlbaranDocumentOrm,
@@ -191,6 +195,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             (
                 "CREATE INDEX IF NOT EXISTS ix_albaran_contratos_merge_document "
                 "ON albaran_contratos_merge (document_id)"
+            ),
+            # Índice para las búsquedas de líneas de contrato por cabecera.
+            (
+                "CREATE INDEX IF NOT EXISTS ix_albaran_contrato_lines_merge_contrato "
+                "ON albaran_contrato_lines_merge (contrato_id)"
             ),
         ]
 
@@ -555,15 +564,30 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         document_id: str,
         contratos: list[ContratoEnrichmentResult],
     ) -> None:
+        """Reemplaza cabeceras de contrato y sus líneas de forma atómica.
+
+        Flujo:
+          1) Verifica que el merge doc existe.
+          2) Borra todas las cabeceras previas del documento. Las líneas
+             caen en cascada a nivel BBDD (``ON DELETE CASCADE``).
+             Incluso así, si el esquema antiguo no tuviera la FK con
+             CASCADE, el delete manual de ``_delete_existing_records``
+             se encarga (en el flujo de save), y aquí al borrar por
+             document_id no quedan huérfanas porque también van por
+             contrato_id = id_cabecera (y esos ids desaparecen).
+          3) Inserta las cabeceras nuevas. Tras cada ``session.flush()``,
+             el atributo ``header_orm.id`` ya está asignado → insertamos
+             sus líneas con el FK correcto.
+        """
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
         with self._session_factory.create_session() as session:
-            # Asegurar que el merge existe para no crear contratos huérfanos.
             merge_doc = session.get(AlbaranDocumentMergeOrm, document_id)
             if merge_doc is None:
                 raise KeyError(f"Documento merge no encontrado: {document_id}")
 
             # Borrado idempotente de los contratos previos.
+            # Las líneas asociadas caen por ON DELETE CASCADE de la FK.
             deleted = session.execute(
                 delete(AlbaranContratoMergeOrm).where(
                     AlbaranContratoMergeOrm.document_id == document_id
@@ -571,31 +595,60 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
             session.flush()
 
+            total_lines_inserted = 0
             for contrato in contratos:
-                session.add(
-                    AlbaranContratoMergeOrm(
-                        document_id=document_id,
-                        codigo_contrato=contrato.codigo_contrato,
-                        nombre_contrato=contrato.nombre_contrato,
-                        fecha_alta_contrato=contrato.fecha_alta_contrato,
-                        fecha_contrato=contrato.fecha_contrato,
-                        vigencia_desde=contrato.vigencia_desde,
-                        vigencia_hasta=contrato.vigencia_hasta,
-                        importe_total=contrato.importe_total,
-                        cif_proveedor=contrato.cif_proveedor,
-                        nombre_proveedor=contrato.nombre_proveedor,
-                        codigo_obra=contrato.codigo_obra,
-                        nombre_obra=contrato.nombre_obra,
-                        fetched_at_utc=now,
-                    )
+                header_orm = AlbaranContratoMergeOrm(
+                    document_id=document_id,
+                    codigo_contrato=contrato.codigo_contrato,
+                    nombre_contrato=contrato.nombre_contrato,
+                    fecha_alta_contrato=contrato.fecha_alta_contrato,
+                    fecha_contrato=contrato.fecha_contrato,
+                    vigencia_desde=contrato.vigencia_desde,
+                    vigencia_hasta=contrato.vigencia_hasta,
+                    importe_total=contrato.importe_total,
+                    cif_proveedor=contrato.cif_proveedor,
+                    nombre_proveedor=contrato.nombre_proveedor,
+                    codigo_obra=contrato.codigo_obra,
+                    nombre_obra=contrato.nombre_obra,
+                    fetched_at_utc=now,
                 )
+                session.add(header_orm)
+                session.flush()  # asigna header_orm.id para las líneas
+
+                for line in (contrato.lines or []):
+                    session.add(
+                        AlbaranContratoLineMergeOrm(
+                            contrato_id=header_orm.id,
+                            codigo_contrato=contrato.codigo_contrato,
+                            linea=line.linea,
+                            numero_linea=line.numero_linea,
+                            codigo_producto=line.codigo_producto,
+                            codigo_alternativo=line.codigo_alternativo,
+                            unidad_medida=line.unidad_medida,
+                            descripcion_linea=line.descripcion_linea,
+                            uds=line.uds,
+                            cantidad_servida=line.cantidad_servida,
+                            cantidad_facturada=line.cantidad_facturada,
+                            pendiente_servir=line.pendiente_servir,
+                            precio_unitario=line.precio_unitario,
+                            precio_bruto=line.precio_bruto,
+                            descuentos=line.descuentos,
+                            importe_linea=line.importe_linea,
+                            cuota_iva=line.cuota_iva,
+                            doc_origen=line.doc_origen,
+                            fetched_at_utc=now,
+                        )
+                    )
+                    total_lines_inserted += 1
+
             session.commit()
             logger.info(
                 "[contrato-enrichment][repo] replace_contratos: "
-                "document_id=%s borrados=%s insertados=%s",
+                "document_id=%s borrados=%s contratos_insertados=%s lineas_insertadas=%s",
                 document_id,
                 deleted.rowcount if hasattr(deleted, "rowcount") else "?",
                 len(contratos),
+                total_lines_inserted,
             )
 
     def set_selected_contrato(
@@ -635,6 +688,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         for document in merge_docs:
             # Los contratos se eliminan por FK ON DELETE CASCADE; aun así,
             # por si la FK no se creó en esquemas antiguos, borramos manual.
+            # Las líneas de contrato caen en cascada con sus cabeceras.
             session.execute(
                 delete(AlbaranContratoMergeOrm).where(
                     AlbaranContratoMergeOrm.document_id == document.id
