@@ -32,7 +32,6 @@ class ContratoLineFromSigrid:
     importe_linea: float | None
     cuota_iva: float | None
     doc_origen: str | None
-    # Partida a la que se imputa la línea (``obrparpar.cod`` / ``obrparpar.res``).
     codigo_partida: str | None
     descripcion_partida: str | None
 
@@ -41,14 +40,18 @@ class ContratoLineFromSigrid:
 class ContratoEnrichmentResult:
     """Cabecera de contrato + líneas + referencia al PDF.
 
-    ``importe_total`` ahora viene de ``ctr.totbas`` (importe SIN IVA),
-    que es el valor que maneja el usuario final en el ERP.
+    ``importe_total`` viene de ``ctr.totbas`` (importe SIN IVA).
 
     ``gra_rep_ide`` es el id del documento PDF del contrato en
-    ``ruesma_rep.gra`` (para descarga posterior vía
-    ``/api/documents/read``). Es el PDF principal del contrato; si hay
+    ``ruesma_rep.gra``. Es el PDF principal del contrato; si hay
     varios PDFs vinculados se guarda el primero en orden de ``rcg.pos``.
     ``None`` si el contrato no tiene PDF vinculado en el ERP.
+
+    Los campos ``pdf_sharepoint_*`` se rellenan TRAS la descarga/subida
+    del PDF a SharePoint. Son transitorios a nivel del DTO:
+      - En la primera ejecución van ``None`` (se rellenan después).
+      - Cuando se reutiliza un PDF ya subido (mismo gra_rep_ide) se
+        pueden inyectar directamente sin descarga.
     """
 
     codigo_contrato: str
@@ -63,4 +66,6 @@ class ContratoEnrichmentResult:
     codigo_obra: str | None
     nombre_obra: str | None
     gra_rep_ide: int | None
+    pdf_sharepoint_relative_path: str | None = None
+    pdf_sharepoint_web_url: str | None = None
     lines: list[ContratoLineFromSigrid] = field(default_factory=list)

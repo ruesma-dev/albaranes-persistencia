@@ -71,14 +71,14 @@ def build_app(settings: Settings) -> FastAPI:
         settings.sigrid_api_database,
     )
     if settings.obra_enrichment_enabled and settings.sigrid_api_configured:
-        sigrid_client = SigridApiObraClient(
+        sigrid_obra_client = SigridApiObraClient(
             base_url=settings.sigrid_api_base_url,
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
         )
         obra_enrichment_service = ObraEnrichmentService(
-            client=sigrid_client,
+            client=sigrid_obra_client,
             repository=repository,
             enabled=True,
         )
@@ -89,19 +89,21 @@ def build_app(settings: Settings) -> FastAPI:
         logger.warning(
             "[obra-enrichment][wiring] NO se crea ObraEnrichmentService. "
             "Motivo: enabled=%s configured=%s. "
-            "Revisa SIGRID_API_BASE_URL / SIGRID_API_FUNCTION_KEY / SIGRID_API_DATABASE / "
-            "OBRA_ENRICHMENT_ENABLED en tu .env.",
+            "Revisa SIGRID_API_BASE_URL / SIGRID_API_FUNCTION_KEY / "
+            "SIGRID_API_DATABASE / OBRA_ENRICHMENT_ENABLED en tu .env.",
             settings.obra_enrichment_enabled,
             settings.sigrid_api_configured,
         )
 
     # ------------------------------------------------------------------ #
-    # Construcción del servicio de enriquecimiento de CONTRATOS (nuevo).
-    # Reutiliza las mismas credenciales Sigrid que el enrichment de obra.
-    # Flag independiente: si en el futuro quieres apagar SOLO el de
-    # contratos sin tocar el de obra, añade CONTRATO_ENRICHMENT_ENABLED
-    # al .env y al Settings. El getattr asegura compatibilidad hacia atrás
-    # si ese campo aún no existe en Settings (se considera activado).
+    # Construcción del servicio de enriquecimiento de CONTRATOS.
+    # Reutiliza las credenciales Sigrid y el MISMO SharePointDocumentStorage
+    # del upload de albaranes para subir también los PDFs de contrato a
+    # <base>/<YYYY>/<MM>/contratos/ (descarga vía /api/documents/read).
+    #
+    # Flag independiente (contrato_enrichment_enabled): permite apagar
+    # SOLO el de contratos sin tocar el de obra. Por defecto True si no
+    # está definido en Settings (compatibilidad hacia atrás via getattr).
     # ------------------------------------------------------------------ #
     contrato_enrichment_service: ContratoEnrichmentService | None = None
     contrato_enabled_flag = getattr(
@@ -125,10 +127,13 @@ def build_app(settings: Settings) -> FastAPI:
         contrato_enrichment_service = ContratoEnrichmentService(
             client=contrato_client,
             repository=repository,
+            pdf_storage=document_storage,
             enabled=True,
         )
         logger.info(
-            "[contrato-enrichment][wiring] ContratoEnrichmentService CREADO y listo."
+            "[contrato-enrichment][wiring] ContratoEnrichmentService CREADO "
+            "(pdf_storage=%s).",
+            type(document_storage).__name__,
         )
     else:
         logger.warning(
@@ -168,6 +173,10 @@ def build_app(settings: Settings) -> FastAPI:
             "obra_enrichment_wired": obra_enrichment_service is not None,
             "contrato_enrichment_enabled": contrato_enabled_flag,
             "contrato_enrichment_wired": contrato_enrichment_service is not None,
+            "contrato_pdf_storage_wired": (
+                contrato_enrichment_service is not None
+                and document_storage is not None
+            ),
             "sigrid_api_base_url": settings.sigrid_api_base_url,
             "sigrid_api_database": settings.sigrid_api_database,
         }

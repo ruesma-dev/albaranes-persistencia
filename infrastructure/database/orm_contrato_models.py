@@ -18,14 +18,11 @@ from infrastructure.database.orm_models import Base
 class AlbaranContratoMergeOrm(Base):
     """Contratos (cabecera) asociados a un albarán por (CIF, obra).
 
-    Relación N:1 con ``albaran_documents_merge``: un documento puede
-    tener N contratos si el ERP devuelve múltiples para la combinación.
-    La selección concreta se guarda en
-    ``albaran_documents_merge.selected_contrato_codigo``.
-
-    ``importe_total`` almacena ``ctr.totbas`` (importe SIN IVA del ERP).
-    ``gra_rep_ide`` apunta al PDF del contrato en ``ruesma_rep.gra``;
-    usable luego para descargar el PDF vía ``/api/documents/read``.
+    ``importe_total`` = ``ctr.totbas`` (sin IVA).
+    ``gra_rep_ide`` = id del PDF del contrato en ``ruesma_rep.gra``.
+    ``pdf_sharepoint_relative_path`` / ``pdf_sharepoint_web_url`` =
+    ubicación del PDF ya subido a SharePoint (rellenados tras la
+    descarga+subida automática en el enrichment).
     """
 
     __tablename__ = "albaran_contratos_merge"
@@ -49,11 +46,10 @@ class AlbaranContratoMergeOrm(Base):
     codigo_obra = Column(String(32), nullable=True)
     nombre_obra = Column(Text, nullable=True)
     gra_rep_ide = Column(Integer, nullable=True)
+    pdf_sharepoint_relative_path = Column(String(1024), nullable=True)
+    pdf_sharepoint_web_url = Column(String(1024), nullable=True)
     fetched_at_utc = Column(String(64), nullable=False)
 
-    # cascade + passive_deletes: al borrar un contrato, las líneas caen
-    # a nivel BBDD por ON DELETE CASCADE. SQLAlchemy no emite DELETEs
-    # explícitos (passive_deletes=True).
     lines = relationship(
         "AlbaranContratoLineMergeOrm",
         back_populates="contrato",
@@ -73,10 +69,7 @@ class AlbaranContratoMergeOrm(Base):
 class AlbaranContratoLineMergeOrm(Base):
     """Líneas de detalle (``ctrpro``) de un contrato de cabecera.
 
-    Incluye la partida (``obrparpar.cod`` / ``obrparpar.res``) a la que
-    se imputa la línea en el desglose de obra.
-
-    Cascada: ``ondelete="CASCADE"`` a nivel BBDD.
+    Incluye partida (``obrparpar.cod`` / ``obrparpar.res``).
     """
 
     __tablename__ = "albaran_contrato_lines_merge"

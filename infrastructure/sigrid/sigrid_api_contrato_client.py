@@ -12,25 +12,14 @@ from domain.models.contrato_models import (
     ContratoEnrichmentResult,
     ContratoLineFromSigrid,
 )
+from domain.ports.contrato_enrichment_port import ContratoPdfPayload
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[contrato-enrichment][sigrid-client]"
 
 
-# ==================================================================== #
-# Query 1: cabecera + líneas en un solo resultset.
-#
-# Cambios respecto a versiones anteriores:
-#   - ``ctr.totbas`` como importe_total (SIN IVA, que es lo que el
-#     usuario del ERP ve como total del contrato).
-#   - LEFT JOIN a ``obrparpar`` para traer partida (cod + res) de cada
-#     línea. Imputación por capítulos de obra.
-#   - Filtro ``con_ctr.emp = 1`` para consistencia con el prototipo
-#     validado.
-#
-# Parámetros: [cif, codigo_obra_normalizado].
-# ==================================================================== #
+# Query cabecera + líneas (ctr.totbas, partida via obrparpar, emp=1).
 _SQL_HEADER_AND_LINES = """\
 SELECT
     ctr.ide             AS contrato_ide,
@@ -78,9 +67,6 @@ AND con_ctr.emp   = 1
 ORDER BY con_ctr.cod, ctrpro.pos
 """
 
-
-# Query 2a (BBDD principal): ruesma.rcg + ruesma.gra por contrato_ide.
-# Devuelve pos (orden) y cod (clave cruzada a ruesma_rep.gra).
 _SQL_GRA_COD_BY_CONTRATO = """\
 SELECT
     rcg.pos             AS rcg_pos,
@@ -93,8 +79,6 @@ WHERE rcg.con = ?
 ORDER BY rcg.pos
 """
 
-# Query 2b (BBDD rep): ruesma_rep.gra por cod.
-# Devuelve ide (el que necesitamos para descarga).
 _SQL_GRA_REP_BY_COD = """\
 SELECT
     ide                 AS gra_rep_ide,
@@ -106,28 +90,7 @@ WHERE cod = ?
 
 
 class SigridApiContratoClient:
-    """Cliente HTTP a ``sigrid-api`` para extraer contratos completos.
-
-    Flujo:
-      1. Query principal (``_SQL_HEADER_AND_LINES``): cabecera + líneas
-         (con partida) en un solo resultset, agrupadas en memoria por
-         ``codigo_contrato``.
-      2. Por cada contrato agrupado, se hace un fetch auxiliar del PDF
-         principal del contrato:
-           a. Query en BBDD principal (``ruesma``) a ``rcg`` + ``gra``
-              para obtener los ``gra.cod`` vinculados al contrato.
-           b. Query en BBDD réplica (``ruesma_rep``) a ``gra`` por cada
-              ``cod`` para obtener el ``ide`` (usable en la descarga de
-              documentos). Nos quedamos con el primer PDF por ``rcg.pos``.
-
-    Por qué 3 queries y no una: el PDF vive en ``ruesma_rep`` (otra BBDD),
-    así que no se puede JOINear con la principal. Y vincular rcg/gra en
-    la query de cabecera multiplicaría filas por documento, enredando la
-    agrupación por ``codigo_contrato``.
-
-    Si algo falla al buscar PDFs, ``gra_rep_ide`` queda ``None`` para ese
-    contrato pero el resto (cabecera + líneas) se devuelve correctamente.
-    """
+    """Cliente HTTP a ``sigrid-api`` para extraer contratos + PDFs."""
 
     def __init__(
         self,
@@ -138,6 +101,7 @@ class SigridApiContratoClient:
         timeout_s: float = 30.0,
         max_rows: int = 1000,
         database_rep: str = "ruesma_rep",
+        pdf_timeout_s: float = 120.0,
     ) -> None:
         if not base_url:
             raise ValueError("SigridApiContratoClient requiere base_url")
@@ -151,19 +115,21 @@ class SigridApiContratoClient:
         self._database_rep = database_rep
         self._timeout_s = float(timeout_s)
         self._max_rows = int(max_rows)
+        self._pdf_timeout_s = float(pdf_timeout_s)
         logger.info(
             "%s Instanciado. base_url=%s database=%s database_rep=%s "
-            "max_rows=%s key_len=%s",
+            "max_rows=%s pdf_timeout_s=%s key_len=%s",
             _LOG_PREFIX,
             self._base_url,
             self._database,
             self._database_rep,
             self._max_rows,
+            self._pdf_timeout_s,
             len(function_key),
         )
 
     # --------------------------------------------------------------- #
-    # API pública
+    # API pública: fetch de contratos
     # --------------------------------------------------------------- #
     def fetch_contratos(
         self,
@@ -178,7 +144,6 @@ class SigridApiContratoClient:
             codigo_obra_normalizado,
         )
 
-        # Paso 1: cabecera + líneas.
         columns, rows = self._post_sql_read(
             sql=_SQL_HEADER_AND_LINES,
             parameters=[cif_proveedor, codigo_obra_normalizado],
@@ -199,9 +164,6 @@ class SigridApiContratoClient:
         if not results_without_pdf:
             return []
 
-        # Paso 2: por cada contrato, su gra_rep_ide del PDF principal.
-        # Si el fetch de un contrato falla, devolvemos None para ese y
-        # continuamos con los demás.
         enriched: list[ContratoEnrichmentResult] = []
         for contrato, contrato_ide in zip(results_without_pdf, contrato_ides):
             gra_rep_ide = self._safe_fetch_gra_rep_ide(contrato_ide=contrato_ide)
@@ -219,6 +181,8 @@ class SigridApiContratoClient:
                     codigo_obra=contrato.codigo_obra,
                     nombre_obra=contrato.nombre_obra,
                     gra_rep_ide=gra_rep_ide,
+                    pdf_sharepoint_relative_path=None,
+                    pdf_sharepoint_web_url=None,
                     lines=contrato.lines,
                 )
             )
@@ -232,7 +196,96 @@ class SigridApiContratoClient:
         return enriched
 
     # --------------------------------------------------------------- #
-    # HTTP primitive
+    # API pública: descarga del binario PDF
+    # --------------------------------------------------------------- #
+    def download_contrato_pdf(
+        self,
+        *,
+        gra_rep_ide: int,
+    ) -> ContratoPdfPayload | None:
+        """Descarga el PDF desde ``ruesma_rep.gra`` vía /api/documents/read.
+
+        La respuesta es binaria (no JSON). El nombre de fichero viene
+        en el header ``X-Document-Filename`` (si el endpoint lo envía;
+        en la Function App actual sí lo hace). Content-Type típico
+        ``application/pdf``.
+
+        Devuelve ``None`` si:
+          - El endpoint responde con body vacío.
+          - El ide no existe (404) — se interpreta como "no hay PDF".
+
+        Lanza ``RuntimeError`` si hay un error de transporte o 5xx —
+        el orquestador decide si continuar con otros contratos o abortar.
+        """
+        url = f"{self._base_url}/api/documents/read"
+        payload = {
+            "database": self._database_rep,
+            "schema": "dbo",
+            "table": "gra",
+            "id_column": "ide",
+            "id_value": int(gra_rep_ide),
+            "blob_column": "ima",
+            "filename_columns": ["nomori", "nom"],
+            "disposition": "attachment",
+        }
+        headers = {
+            "x-functions-key": self._function_key,
+            "Content-Type": "application/json",
+        }
+
+        logger.info(
+            "%s DOWNLOAD REQUEST -> POST %s gra_rep_ide=%s",
+            _LOG_PREFIX,
+            url,
+            gra_rep_ide,
+        )
+
+        try:
+            with httpx.Client(timeout=self._pdf_timeout_s) as client:
+                response = client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            logger.exception(
+                "%s DOWNLOAD FALLO de transporte. gra_rep_ide=%s exc=%r",
+                _LOG_PREFIX,
+                gra_rep_ide,
+                exc,
+            )
+            raise
+
+        status = response.status_code
+        content = response.content or b""
+        content_type = response.headers.get("Content-Type", "") or None
+        filename_header = response.headers.get("X-Document-Filename", "") or ""
+
+        logger.info(
+            "%s DOWNLOAD RESPONSE <- status=%s bytes=%s content_type=%s filename=%r",
+            _LOG_PREFIX,
+            status,
+            len(content),
+            content_type,
+            filename_header,
+        )
+
+        if status == 404:
+            return None
+        if status >= 400:
+            # Trunca el body si viniera como error JSON para el log.
+            preview = content[:300].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"sigrid-api /documents/read respondió {status}: {preview}"
+            )
+        if not content:
+            return None
+
+        filename = filename_header.strip() or f"contrato_{gra_rep_ide}.pdf"
+        return ContratoPdfPayload(
+            filename=filename,
+            content=content,
+            content_type=content_type,
+        )
+
+    # --------------------------------------------------------------- #
+    # HTTP primitive para queries SQL
     # --------------------------------------------------------------- #
     def _post_sql_read(
         self,
@@ -300,19 +353,12 @@ class SigridApiContratoClient:
         rows: list[list[Any]] = list(body.get("rows") or [])
         return columns, rows
 
-    # --------------------------------------------------------------- #
-    # Agrupación cabecera + líneas
-    # --------------------------------------------------------------- #
     @staticmethod
     def _group_rows_by_contrato(
         *,
         columns: list[str],
         rows: list[list[Any]],
     ) -> tuple[list[int], list[ContratoEnrichmentResult]]:
-        """Agrupa filas por codigo_contrato. Devuelve (ides, resultados)
-        en el mismo orden para que luego podamos asociar el PDF correcto
-        a cada contrato.
-        """
         buckets: "OrderedDict[str, tuple[dict[str, Any], list[ContratoLineFromSigrid]]]" = (
             OrderedDict()
         )
@@ -328,7 +374,6 @@ class SigridApiContratoClient:
 
             linea_value = row_map.get("linea")
             if linea_value is None:
-                # Contrato sin líneas en el ERP (LEFT JOIN no casó).
                 continue
 
             buckets[codigo][1].append(
@@ -373,22 +418,15 @@ class SigridApiContratoClient:
                     nombre_proveedor=_opt_str(header_row.get("nombre_proveedor")),
                     codigo_obra=_opt_str(header_row.get("codigo_obra")),
                     nombre_obra=_opt_str(header_row.get("nombre_obra")),
-                    gra_rep_ide=None,  # se rellena en fetch_contratos
+                    gra_rep_ide=None,
+                    pdf_sharepoint_relative_path=None,
+                    pdf_sharepoint_web_url=None,
                     lines=lines,
                 )
             )
         return contrato_ides, results
 
-    # --------------------------------------------------------------- #
-    # PDF lookup: rcg.con → ruesma.gra.cod → ruesma_rep.gra.ide
-    # --------------------------------------------------------------- #
     def _safe_fetch_gra_rep_ide(self, *, contrato_ide: int) -> int | None:
-        """Igual que ``_fetch_gra_rep_ide`` pero NO propaga excepciones.
-
-        Si Sigrid responde mal para la búsqueda de PDFs, lo registramos
-        pero no rompemos la persistencia del contrato — la cabecera y
-        las líneas ya valen por sí solas.
-        """
         if contrato_ide == 0:
             return None
         try:
@@ -403,12 +441,6 @@ class SigridApiContratoClient:
             return None
 
     def _fetch_gra_rep_ide(self, *, contrato_ide: int) -> int | None:
-        """Encadena las 2 queries auxiliares para obtener ruesma_rep.gra.ide.
-
-        Devuelve el ``ide`` del PRIMER PDF vinculado al contrato,
-        ordenado por ``rcg.pos`` (orden de vinculación). Si hay varios,
-        se toma el primero; si ninguno es PDF, ``None``.
-        """
         cols, rows = self._post_sql_read(
             sql=_SQL_GRA_COD_BY_CONTRATO,
             parameters=[contrato_ide],
@@ -416,7 +448,6 @@ class SigridApiContratoClient:
             label=f"rcg_gra_for_ctr_{contrato_ide}",
         )
 
-        # Ya viene ordenado por rcg.pos. Filtramos a PDFs (nombre .pdf).
         pdf_cods: list[str] = []
         for row in rows:
             row_map = dict(zip(cols, row))
@@ -432,15 +463,8 @@ class SigridApiContratoClient:
                 pdf_cods.append(cod)
 
         if not pdf_cods:
-            logger.info(
-                "%s contrato_ide=%s sin PDFs vinculados",
-                _LOG_PREFIX,
-                contrato_ide,
-            )
             return None
 
-        # Para cada cod, resolvemos el ide en ruesma_rep. En cuanto
-        # encontremos el primero válido, devolvemos.
         for cod in pdf_cods:
             cols_rep, rows_rep = self._post_sql_read(
                 sql=_SQL_GRA_REP_BY_COD,
@@ -461,22 +485,9 @@ class SigridApiContratoClient:
                     )
                     return gra_rep_ide
 
-        # PDFs localizados en ruesma.gra pero ninguno aparece en
-        # ruesma_rep — extraño, pero posible en cierta fase de
-        # sincronización. Lo registramos como warning.
-        logger.warning(
-            "%s contrato_ide=%s PDFs vinculados pero ningún gra_rep_ide; "
-            "cods=%s",
-            _LOG_PREFIX,
-            contrato_ide,
-            pdf_cods,
-        )
         return None
 
 
-# --------------------------------------------------------------------- #
-# Helpers de parseo defensivo
-# --------------------------------------------------------------------- #
 def _opt_str(value: Any) -> str | None:
     if value is None:
         return None

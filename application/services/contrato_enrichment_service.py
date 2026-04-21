@@ -4,8 +4,10 @@ from __future__ import annotations
 import logging
 
 from application.services.obra_code_normalizer import normalize_obra_code
+from domain.models.contrato_models import ContratoEnrichmentResult
 from domain.ports.contrato_enrichment_port import ContratoEnrichmentClient
 from domain.ports.contrato_merge_repository_port import ContratoMergeRepository
+from domain.ports.contrato_pdf_storage_port import ContratoPdfStorage
 
 logger = logging.getLogger(__name__)
 
@@ -16,17 +18,27 @@ class ContratoEnrichmentService:
     """Orquesta la búsqueda y persistencia de contratos proveedor×obra.
 
     Flujo:
-      1. Lee (cif, obra_codigo) del merge recién persistido.
-      2. Normaliza el código de obra con la MISMA regla que obra-enrichment.
-      3. Si falta el CIF o la obra no valida, omite.
-      4. Llama a Sigrid (lista completa de contratos que casen).
-      5. Borra los contratos previos del merge e inserta los nuevos.
-      6. Si hay EXACTAMENTE 1 contrato, lo auto-selecciona. Si hay 0 o
-         varios, deja selected_contrato_codigo a NULL (el usuario elige
-         en el portal).
+      1. Lee (cif, obra) del merge.
+      2. Normaliza y valida.
+      3. Llama a Sigrid → lista de contratos con ``gra_rep_ide``.
+      4. Lee el MAPA de PDFs existentes ANTES del replace (para reutilizar
+         los que no hayan cambiado de versión).
+      5. Para cada contrato: si el ``gra_rep_ide`` coincide con el
+         previamente guardado, inyecta los paths en el DTO para que
+         ``replace_contratos`` los persista directamente.
+      6. ``replace_contratos`` (borra + inserta todo).
+      7. Para los contratos donde el ``gra_rep_ide`` cambió o es nuevo,
+         descarga el PDF de Sigrid y lo sube a SharePoint. Tras cada
+         upload, actualiza los paths en BBDD vía
+         ``update_contrato_pdf_paths``.
+      8. Si hay EXACTAMENTE 1 contrato, lo auto-selecciona.
 
-    Best-effort: cualquier fallo (red, HTTP 5xx, validación) se captura
-    y loguea. No rompe el pipeline de persistencia.
+    Best-effort a nivel de PDF: un fallo de descarga/subida no rompe
+    el enrichment global. El contrato queda persistido sin PDF y la
+    próxima ejecución reintenta.
+
+    El storage es OPCIONAL: si no se inyecta, toda la lógica de PDF se
+    omite y el servicio se comporta como la versión anterior.
     """
 
     def __init__(
@@ -34,21 +46,24 @@ class ContratoEnrichmentService:
         *,
         client: ContratoEnrichmentClient,
         repository: ContratoMergeRepository,
+        pdf_storage: ContratoPdfStorage | None = None,
         enabled: bool = True,
     ) -> None:
         self._client = client
         self._repository = repository
+        self._pdf_storage = pdf_storage
         self._enabled = enabled
         logger.info(
-            "%s ContratoEnrichmentService INSTANCIADO (enabled=%s client=%s repo=%s)",
+            "%s ContratoEnrichmentService INSTANCIADO "
+            "(enabled=%s client=%s repo=%s pdf_storage=%s)",
             _LOG_PREFIX,
             enabled,
             type(client).__name__,
             type(repository).__name__,
+            type(pdf_storage).__name__ if pdf_storage is not None else "None",
         )
 
     def enrich_merge_document(self, *, merge_document_id: str) -> int:
-        """Devuelve el número de contratos insertados (0 si se omitió)."""
         logger.info(
             "%s enrich_merge_document() INVOCADO document_id=%s",
             _LOG_PREFIX,
@@ -56,78 +71,127 @@ class ContratoEnrichmentService:
         )
 
         if not self._enabled:
-            logger.info(
-                "%s DESHABILITADO por configuración. document_id=%s",
-                _LOG_PREFIX,
-                merge_document_id,
-            )
             return 0
 
         cif, obra_raw = self._repository.get_merge_cif_and_obra(
             document_id=merge_document_id,
         )
-        logger.info(
-            "%s Paso 1 — leídos del merge: cif=%r obra_raw=%r",
-            _LOG_PREFIX,
-            cif,
-            obra_raw,
-        )
-
         cif_clean = (cif or "").strip().upper().replace(" ", "") or None
         obra_norm = normalize_obra_code(obra_raw)
-        logger.info(
-            "%s Paso 2 — normalizados: cif=%r obra=%r",
-            _LOG_PREFIX,
-            cif_clean,
-            obra_norm,
-        )
         if not cif_clean or not obra_norm:
             logger.warning(
-                "%s Faltan datos o no validan; se OMITE consulta. cif=%r obra=%r",
+                "%s Faltan datos o no validan; se OMITE. cif=%r obra=%r",
                 _LOG_PREFIX,
                 cif_clean,
                 obra_norm,
             )
             return 0
 
-        logger.info(
-            "%s Paso 3 — LLAMANDO a Sigrid (cif=%s obra=%s)...",
-            _LOG_PREFIX,
-            cif_clean,
-            obra_norm,
-        )
         try:
             contratos = self._client.fetch_contratos(
                 cif_proveedor=cif_clean,
                 codigo_obra_normalizado=obra_norm,
             )
-        except Exception as exc:
-            logger.exception(
-                "%s ERROR llamando a Sigrid. exc=%r",
-                _LOG_PREFIX,
-                exc,
-            )
+        except Exception:
+            logger.exception("%s ERROR llamando a Sigrid.", _LOG_PREFIX)
             return 0
 
         logger.info(
-            "%s Paso 3 — Sigrid devolvió %s contrato(s)",
-            _LOG_PREFIX,
-            len(contratos),
+            "%s Sigrid devolvió %s contrato(s)", _LOG_PREFIX, len(contratos)
         )
 
+        # Paso 4: mapa de PDFs ya guardados ANTES del replace.
+        # Si el repo no implementa get_existing_pdf_paths (caso de
+        # compatibilidad hacia atrás con mocks), se queda vacío.
+        existing_pdfs: dict[str, tuple[int | None, str | None, str | None]] = {}
+        try:
+            existing_pdfs = self._repository.get_existing_pdf_paths(
+                document_id=merge_document_id,
+            )
+        except Exception:
+            logger.exception(
+                "%s No se pudo leer mapa de PDFs existentes; se ignora.",
+                _LOG_PREFIX,
+            )
+
+        # Paso 5: si el gra_rep_ide del contrato nuevo coincide con el
+        # previo, reutilizamos los paths directamente en el DTO para
+        # que el replace los persista sin tener que volver a subir.
+        reused_count = 0
+        contratos_with_maybe_reused: list[ContratoEnrichmentResult] = []
+        pending_pdf_indices: list[int] = []  # índices en contratos_with_maybe_reused
+        for idx, contrato in enumerate(contratos):
+            prev = existing_pdfs.get(contrato.codigo_contrato)
+            if (
+                prev is not None
+                and prev[0] is not None
+                and contrato.gra_rep_ide is not None
+                and prev[0] == contrato.gra_rep_ide
+                and prev[1] is not None
+            ):
+                # Reutilización: inyectamos paths previos en el DTO.
+                contratos_with_maybe_reused.append(
+                    ContratoEnrichmentResult(
+                        codigo_contrato=contrato.codigo_contrato,
+                        nombre_contrato=contrato.nombre_contrato,
+                        fecha_alta_contrato=contrato.fecha_alta_contrato,
+                        fecha_contrato=contrato.fecha_contrato,
+                        vigencia_desde=contrato.vigencia_desde,
+                        vigencia_hasta=contrato.vigencia_hasta,
+                        importe_total=contrato.importe_total,
+                        cif_proveedor=contrato.cif_proveedor,
+                        nombre_proveedor=contrato.nombre_proveedor,
+                        codigo_obra=contrato.codigo_obra,
+                        nombre_obra=contrato.nombre_obra,
+                        gra_rep_ide=contrato.gra_rep_ide,
+                        pdf_sharepoint_relative_path=prev[1],
+                        pdf_sharepoint_web_url=prev[2],
+                        lines=contrato.lines,
+                    )
+                )
+                reused_count += 1
+            else:
+                contratos_with_maybe_reused.append(contrato)
+                if contrato.gra_rep_ide is not None and self._pdf_storage is not None:
+                    pending_pdf_indices.append(idx)
+
+        logger.info(
+            "%s PDFs reutilizados=%s pendientes_descargar=%s",
+            _LOG_PREFIX,
+            reused_count,
+            len(pending_pdf_indices),
+        )
+
+        # Paso 6: replace atómico (con paths ya rellenos para reutilizados).
         try:
             self._repository.replace_contratos(
                 document_id=merge_document_id,
-                contratos=contratos,
+                contratos=contratos_with_maybe_reused,
             )
-        except Exception as exc:
-            logger.exception(
-                "%s ERROR guardando contratos. exc=%r",
-                _LOG_PREFIX,
-                exc,
-            )
+        except Exception:
+            logger.exception("%s ERROR guardando contratos.", _LOG_PREFIX)
             return 0
 
+        # Paso 7: descargar + subir PDFs pendientes, y actualizar paths.
+        if self._pdf_storage is not None:
+            for idx in pending_pdf_indices:
+                self._download_and_store_pdf(
+                    document_id=merge_document_id,
+                    contrato=contratos_with_maybe_reused[idx],
+                )
+        elif any(c.gra_rep_ide is not None for c in contratos_with_maybe_reused):
+            logger.info(
+                "%s Hay %s contrato(s) con PDF pero no se ha inyectado "
+                "pdf_storage; se omite descarga/subida.",
+                _LOG_PREFIX,
+                sum(
+                    1
+                    for c in contratos_with_maybe_reused
+                    if c.gra_rep_ide is not None
+                ),
+            )
+
+        # Paso 8: auto-selección si hay uno solo.
         if len(contratos) == 1:
             codigo = contratos[0].codigo_contrato
             try:
@@ -135,38 +199,83 @@ class ContratoEnrichmentService:
                     document_id=merge_document_id,
                     codigo_contrato=codigo,
                 )
-                logger.info(
-                    "%s Auto-seleccionado contrato único: %s",
-                    _LOG_PREFIX,
-                    codigo,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "%s ERROR auto-seleccionando contrato. codigo=%s exc=%r",
-                    _LOG_PREFIX,
-                    codigo,
-                    exc,
-                )
-        elif len(contratos) > 1:
-            logger.info(
-                "%s %s contratos encontrados; NO se auto-selecciona "
-                "(el usuario elegirá en el portal).",
-                _LOG_PREFIX,
-                len(contratos),
-            )
-        else:
-            logger.warning(
-                "%s 0 contratos para (cif=%s, obra=%s). "
-                "selected_contrato_codigo queda a NULL.",
-                _LOG_PREFIX,
-                cif_clean,
-                obra_norm,
-            )
+            except Exception:
+                logger.exception("%s ERROR auto-seleccionando contrato.", _LOG_PREFIX)
 
-        logger.info(
-            "%s OK — document_id=%s contratos_guardados=%s",
-            _LOG_PREFIX,
-            merge_document_id,
-            len(contratos),
-        )
         return len(contratos)
+
+    def _download_and_store_pdf(
+        self,
+        *,
+        document_id: str,
+        contrato: ContratoEnrichmentResult,
+    ) -> None:
+        """Descarga + sube + actualiza BBDD para un contrato concreto.
+
+        Silencia todas las excepciones: el objetivo es que un contrato
+        con problema de PDF no impida procesar los otros. Lo grave se
+        loguea como exception; lo esperado como warning.
+        """
+        if self._pdf_storage is None:
+            return
+        if contrato.gra_rep_ide is None:
+            return
+
+        try:
+            payload = self._client.download_contrato_pdf(
+                gra_rep_ide=contrato.gra_rep_ide,
+            )
+        except Exception:
+            logger.exception(
+                "%s FALLO descarga PDF. codigo=%s gra_rep_ide=%s",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+                contrato.gra_rep_ide,
+            )
+            return
+
+        if payload is None:
+            logger.warning(
+                "%s Descarga PDF devolvió vacío. codigo=%s gra_rep_ide=%s",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+                contrato.gra_rep_ide,
+            )
+            return
+
+        try:
+            stored = self._pdf_storage.upload_contrato_pdf(
+                filename=payload.filename,
+                file_bytes=payload.content,
+                codigo_contrato=contrato.codigo_contrato,
+                gra_rep_ide=contrato.gra_rep_ide,
+            )
+        except Exception:
+            logger.exception(
+                "%s FALLO subida PDF a SharePoint. codigo=%s gra_rep_ide=%s",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+                contrato.gra_rep_ide,
+            )
+            return
+
+        try:
+            self._repository.update_contrato_pdf_paths(
+                document_id=document_id,
+                codigo_contrato=contrato.codigo_contrato,
+                relative_path=stored.relative_path,
+                web_url=stored.web_url,
+            )
+            logger.info(
+                "%s PDF OK codigo=%s gra_rep_ide=%s -> %s",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+                contrato.gra_rep_ide,
+                stored.relative_path,
+            )
+        except Exception:
+            logger.exception(
+                "%s FALLO persistiendo paths del PDF. codigo=%s",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+            )

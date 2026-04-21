@@ -24,9 +24,6 @@ from domain.models.extraction_models import (
 )
 from domain.models.persistence_models import ExistingDocument, StoredFile
 from domain.ports.albaran_repository import AlbaranRepository
-# Importar orm_contrato_models registra AlbaranContratoMergeOrm y
-# AlbaranContratoLineMergeOrm con Base.metadata para que create_all las
-# descubra. NO mover este import.
 from infrastructure.database.orm_contrato_models import (
     AlbaranContratoLineMergeOrm,
     AlbaranContratoMergeOrm,
@@ -165,21 +162,23 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 ]
             )
 
-        # Columna nueva: contrato seleccionado por el usuario (o auto-
-        # seleccionado si solo hay 1). Referencia soft (string, no FK).
         alter_statements.append(
             "ALTER TABLE albaran_documents_merge "
             "ADD COLUMN IF NOT EXISTS selected_contrato_codigo VARCHAR(64)"
         )
 
-        # Columnas nuevas en contratos (schema evolutivo).
-        # ``gra_rep_ide``: id del PDF en ruesma_rep.gra (para descarga).
-        alter_statements.append(
-            "ALTER TABLE albaran_contratos_merge "
-            "ADD COLUMN IF NOT EXISTS gra_rep_ide INTEGER"
+        # Columnas nuevas en albaran_contratos_merge.
+        alter_statements.extend(
+            [
+                "ALTER TABLE albaran_contratos_merge "
+                "ADD COLUMN IF NOT EXISTS gra_rep_ide INTEGER",
+                "ALTER TABLE albaran_contratos_merge "
+                "ADD COLUMN IF NOT EXISTS pdf_sharepoint_relative_path VARCHAR(1024)",
+                "ALTER TABLE albaran_contratos_merge "
+                "ADD COLUMN IF NOT EXISTS pdf_sharepoint_web_url VARCHAR(1024)",
+            ]
         )
 
-        # Columnas nuevas en líneas de contrato (partida).
         alter_statements.extend(
             [
                 (
@@ -508,18 +507,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         with self._session_factory.create_session() as session:
             document = session.get(AlbaranDocumentMergeOrm, document_id)
             if document is None:
-                logger.warning(
-                    "[obra-enrichment][repo] get_merge_obra_codigo: "
-                    "documento merge NO encontrado. document_id=%s",
-                    document_id,
-                )
                 return None
-            logger.info(
-                "[obra-enrichment][repo] get_merge_obra_codigo: "
-                "document_id=%s obra_codigo=%r",
-                document_id,
-                document.obra_codigo,
-            )
             return document.obra_codigo
 
     def update_merge_obra_fields(
@@ -534,23 +522,9 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             document = session.get(AlbaranDocumentMergeOrm, document_id)
             if document is None:
                 raise KeyError(f"Documento merge no encontrado: {document_id}")
-            logger.info(
-                "[obra-enrichment][repo] update_merge_obra_fields: "
-                "document_id=%s ANTES obra_nombre=%r obra_direccion=%r",
-                document_id,
-                document.obra_nombre,
-                document.obra_direccion,
-            )
             document.obra_nombre = obra_nombre
             document.obra_direccion = obra_direccion
             session.commit()
-            logger.info(
-                "[obra-enrichment][repo] update_merge_obra_fields: "
-                "document_id=%s DESPUÉS obra_nombre=%r obra_direccion=%r (committed)",
-                document_id,
-                obra_nombre,
-                obra_direccion,
-            )
 
     # ================================================================== #
     # Puerto ContratoMergeRepository (cumplido por duck-typing)
@@ -564,20 +538,34 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         with self._session_factory.create_session() as session:
             document = session.get(AlbaranDocumentMergeOrm, document_id)
             if document is None:
-                logger.warning(
-                    "[contrato-enrichment][repo] get_merge_cif_and_obra: "
-                    "documento merge NO encontrado. document_id=%s",
-                    document_id,
-                )
                 return None, None
-            logger.info(
-                "[contrato-enrichment][repo] get_merge_cif_and_obra: "
-                "document_id=%s cif=%r obra=%r",
-                document_id,
-                document.proveedor_cif,
-                document.obra_codigo,
-            )
             return document.proveedor_cif, document.obra_codigo
+
+    def get_existing_pdf_paths(
+        self,
+        *,
+        document_id: str,
+    ) -> dict[str, tuple[int | None, str | None, str | None]]:
+        """Mapa de PDFs ya subidos para los contratos de un documento.
+
+        Se llama ANTES del replace_contratos para saber qué ``gra_rep_ide``
+        y ``pdf_*`` teníamos, y poder evitar la descarga+subida si la
+        versión del PDF no cambió.
+        """
+        self.initialize()
+        result: dict[str, tuple[int | None, str | None, str | None]] = {}
+        with self._session_factory.create_session() as session:
+            rows = session.execute(
+                select(
+                    AlbaranContratoMergeOrm.codigo_contrato,
+                    AlbaranContratoMergeOrm.gra_rep_ide,
+                    AlbaranContratoMergeOrm.pdf_sharepoint_relative_path,
+                    AlbaranContratoMergeOrm.pdf_sharepoint_web_url,
+                ).where(AlbaranContratoMergeOrm.document_id == document_id)
+            ).all()
+            for codigo, ide, rel_path, web_url in rows:
+                result[codigo] = (ide, rel_path, web_url)
+        return result
 
     def replace_contratos(
         self,
@@ -587,12 +575,10 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
     ) -> None:
         """Reemplaza cabeceras + líneas de contrato atómicamente.
 
-        Flujo:
-          1) Verifica que el merge doc existe.
-          2) Borra cabeceras previas. Líneas caen por ON DELETE CASCADE.
-          3) Inserta cada cabecera con ``gra_rep_ide``, hace ``flush()``
-             para obtener el id autogenerado, e inserta sus líneas con
-             partida.
+        Persiste ``gra_rep_ide`` + ``pdf_*`` si el DTO los trae (caso de
+        reutilización). Para los contratos nuevos, los ``pdf_*`` van
+        ``None`` y el orquestador los actualiza luego vía
+        ``update_contrato_pdf_paths``.
         """
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
@@ -624,10 +610,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     codigo_obra=contrato.codigo_obra,
                     nombre_obra=contrato.nombre_obra,
                     gra_rep_ide=contrato.gra_rep_ide,
+                    pdf_sharepoint_relative_path=contrato.pdf_sharepoint_relative_path,
+                    pdf_sharepoint_web_url=contrato.pdf_sharepoint_web_url,
                     fetched_at_utc=now,
                 )
                 session.add(header_orm)
-                session.flush()  # asigna header_orm.id
+                session.flush()
 
                 for line in (contrato.lines or []):
                     session.add(
@@ -660,13 +648,53 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             session.commit()
             logger.info(
                 "[contrato-enrichment][repo] replace_contratos: "
-                "document_id=%s borrados=%s contratos_insertados=%s "
-                "lineas_insertadas=%s pdfs=%s",
+                "document_id=%s borrados=%s contratos=%s lineas=%s "
+                "pdfs_con_path_inicial=%s",
                 document_id,
                 deleted.rowcount if hasattr(deleted, "rowcount") else "?",
                 len(contratos),
                 total_lines_inserted,
-                sum(1 for c in contratos if c.gra_rep_ide is not None),
+                sum(
+                    1
+                    for c in contratos
+                    if c.pdf_sharepoint_relative_path is not None
+                ),
+            )
+
+    def update_contrato_pdf_paths(
+        self,
+        *,
+        document_id: str,
+        codigo_contrato: str,
+        relative_path: str | None,
+        web_url: str | None,
+    ) -> None:
+        """Actualiza los paths del PDF para un contrato concreto."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            session.execute(
+                text(
+                    "UPDATE albaran_contratos_merge "
+                    "SET pdf_sharepoint_relative_path = :rel, "
+                    "    pdf_sharepoint_web_url = :url "
+                    "WHERE document_id = :doc_id "
+                    "  AND codigo_contrato = :codigo"
+                ),
+                {
+                    "rel": relative_path,
+                    "url": web_url,
+                    "doc_id": document_id,
+                    "codigo": codigo_contrato,
+                },
+            )
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] update_contrato_pdf_paths "
+                "doc=%s codigo=%s rel=%s url=%s",
+                document_id,
+                codigo_contrato,
+                relative_path,
+                web_url,
             )
 
     def set_selected_contrato(
@@ -686,12 +714,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 {"codigo": codigo_contrato, "doc_id": document_id},
             )
             session.commit()
-            logger.info(
-                "[contrato-enrichment][repo] set_selected_contrato: "
-                "document_id=%s codigo_contrato=%r",
-                document_id,
-                codigo_contrato,
-            )
 
     def _delete_existing_records(self, *, session: Any, source_sha256: str) -> None:
         merge_docs = session.scalars(
@@ -700,8 +722,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
         ).all()
         for document in merge_docs:
-            # Los contratos (y sus líneas) caen en cascada; borramos
-            # manual por si la FK CASCADE no existiera en esquemas antiguos.
             session.execute(
                 delete(AlbaranContratoMergeOrm).where(
                     AlbaranContratoMergeOrm.document_id == document.id

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -13,6 +14,7 @@ from urllib.parse import quote
 import httpx
 
 from domain.models.persistence_models import StoredFile
+from domain.ports.contrato_pdf_storage_port import StoredContratoPdf
 from domain.ports.document_storage import DocumentStorage
 from infrastructure.graph.token_provider import GraphTokenProvider
 
@@ -36,12 +38,17 @@ class _ArtifactSpec:
     payload: dict[str, Any] | None
     request_type: str
     response_type: str
-
-    # Ayudas para que el llamador distinga si es request o response.
     is_request: bool = True
 
 
 class SharePointDocumentStorage(DocumentStorage):
+    """Storage de albaranes + artefactos IA en SharePoint.
+
+    Implementa también ``ContratoPdfStorage`` por duck-typing via el
+    método ``upload_contrato_pdf`` — se aprovechan los helpers Graph
+    ya resueltos (_ensure_child_folder, _upload_file_by_parent, etc.).
+    """
+
     def __init__(
         self,
         *,
@@ -102,6 +109,20 @@ class SharePointDocumentStorage(DocumentStorage):
             for char in (filename or "document.bin")
         )
         return cleaned.strip().strip(".") or "document.bin"
+
+    @staticmethod
+    def _safe_segment(value: str, fallback: str) -> str:
+        """Sanitiza un valor para usarlo como segmento de nombre de archivo.
+
+        Usado para componer ``<codigo>_<ide>_<nombre>.pdf``. Elimina
+        separadores de path y caracteres inválidos, comprime espacios.
+        """
+        if not value:
+            return fallback
+        cleaned = re.sub(r'[<>:"/\\|?*]+', "_", value.strip())
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = cleaned.strip("._")
+        return cleaned or fallback
 
     @staticmethod
     def _encode_sharing_url(url: str) -> str:
@@ -482,6 +503,9 @@ class SharePointDocumentStorage(DocumentStorage):
         )
         return artifact_relative_path, str(uploaded.get("webUrl") or "").strip() or None
 
+    # ================================================================ #
+    # API pública: upload de albaranes (inalterada)
+    # ================================================================ #
     def upload(
         self,
         *,
@@ -797,4 +821,147 @@ class SharePointDocumentStorage(DocumentStorage):
             cla_input_web_url=cla_input_web_url,
             cla_output_relative_path=cla_output_relative_path,
             cla_output_web_url=cla_output_web_url,
+        )
+
+    # ================================================================ #
+    # API pública: upload de PDFs de contrato
+    # ================================================================ #
+    def upload_contrato_pdf(
+        self,
+        *,
+        filename: str,
+        file_bytes: bytes,
+        codigo_contrato: str,
+        gra_rep_ide: int,
+    ) -> StoredContratoPdf:
+        """Sube un PDF de contrato a ``<base>/<YYYY>/<MM>/contratos/``.
+
+        El nombre final es ``<codigo_contrato>_<gra_rep_ide>_<safe_name>.pdf``
+        — determinista para el par (codigo, ide). Si Sigrid cambia el
+        ``gra_rep_ide`` del contrato (nueva versión del PDF) se sube un
+        archivo nuevo con otro nombre, no se sobrescribe el antiguo.
+
+        NO lanza en fallos internos: si algo del upload falla, propaga
+        la excepción al orquestador. Este método solo hace el mecánico.
+        """
+        if not file_bytes:
+            raise ValueError("upload_contrato_pdf: file_bytes vacío.")
+
+        # Construcción del nombre final determinista.
+        safe_codigo = self._safe_segment(codigo_contrato, fallback="contrato")
+        safe_name = self._safe_filename(filename or f"contrato_{gra_rep_ide}.pdf")
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name = f"{safe_name}.pdf"
+        final_name = f"{safe_codigo}_{gra_rep_ide}_{safe_name}"
+
+        # Carpeta destino: <base>/<YYYY>/<MM>/contratos/
+        now = datetime.now(timezone.utc)
+        year = now.strftime("%Y")
+        month = now.strftime("%m")
+
+        logger.info(
+            "[contrato-pdf][sp] upload_contrato_pdf INICIO "
+            "codigo=%s gra_rep_ide=%s bytes=%s final_name=%s",
+            codigo_contrato,
+            gra_rep_ide,
+            len(file_bytes),
+            final_name,
+        )
+
+        if self._mode == "drive_id":
+            assert self._drive_id is not None
+            drive_id = self._drive_id
+            base_parent_id = self._ensure_folder_path_from_root(
+                drive_id=drive_id,
+                folder_path=self._base_folder_path(None),
+            )
+            year_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=base_parent_id,
+                folder_name=year,
+            )
+            month_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=year_id,
+                folder_name=month,
+            )
+            contratos_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=month_id,
+                folder_name="contratos",
+            )
+            uploaded = self._upload_file_by_parent(
+                drive_id=drive_id,
+                parent_item_id=contratos_id,
+                filename=final_name,
+                mime_type="application/pdf",
+                file_bytes=file_bytes,
+            )
+            relative_path = str(
+                PurePosixPath(self._base_folder_path(None))
+                / year
+                / month
+                / "contratos"
+                / final_name
+            )
+
+        elif self._mode == "folder_url":
+            base_folder = self._resolve_folder_from_share_url()
+            drive_id = base_folder.drive_id
+            year_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=base_folder.item_id,
+                folder_name=year,
+            )
+            month_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=year_id,
+                folder_name=month,
+            )
+            contratos_id = self._ensure_child_folder(
+                drive_id=drive_id,
+                parent_item_id=month_id,
+                folder_name="contratos",
+            )
+            uploaded = self._upload_file_by_parent(
+                drive_id=drive_id,
+                parent_item_id=contratos_id,
+                filename=final_name,
+                mime_type="application/pdf",
+                file_bytes=file_bytes,
+            )
+            relative_path = str(
+                PurePosixPath(base_folder.folder_name or "albaranes")
+                / year
+                / month
+                / "contratos"
+                / final_name
+            )
+
+        else:
+            site_id = self._resolve_site_id()
+            drive_id = self._resolve_drive_id(site_id)
+            relative_path = str(
+                PurePosixPath(self._base_folder_path(None))
+                / year
+                / month
+                / "contratos"
+                / final_name
+            )
+            uploaded = self._upload_file_by_relative_path(
+                drive_id=drive_id,
+                relative_path=relative_path,
+                mime_type="application/pdf",
+                file_bytes=file_bytes,
+            )
+
+        web_url = str(uploaded.get("webUrl") or "").strip() or None
+        logger.info(
+            "[contrato-pdf][sp] upload_contrato_pdf OK relative_path=%s web_url=%s",
+            relative_path,
+            web_url,
+        )
+        return StoredContratoPdf(
+            relative_path=relative_path,
+            web_url=web_url,
         )
