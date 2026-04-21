@@ -22,6 +22,10 @@ class AlbaranContratoMergeOrm(Base):
     tener N contratos si el ERP devuelve múltiples para la combinación.
     La selección concreta se guarda en
     ``albaran_documents_merge.selected_contrato_codigo``.
+
+    ``importe_total`` almacena ``ctr.totbas`` (importe SIN IVA del ERP).
+    ``gra_rep_ide`` apunta al PDF del contrato en ``ruesma_rep.gra``;
+    usable luego para descargar el PDF vía ``/api/documents/read``.
     """
 
     __tablename__ = "albaran_contratos_merge"
@@ -39,17 +43,17 @@ class AlbaranContratoMergeOrm(Base):
     fecha_contrato = Column(Integer, nullable=True)
     vigencia_desde = Column(Integer, nullable=True)
     vigencia_hasta = Column(Integer, nullable=True)
-    importe_total = Column(Float, nullable=True)
+    importe_total = Column(Float, nullable=True)  # ctr.totbas (sin IVA)
     cif_proveedor = Column(String(32), nullable=True)
     nombre_proveedor = Column(Text, nullable=True)
     codigo_obra = Column(String(32), nullable=True)
     nombre_obra = Column(Text, nullable=True)
+    gra_rep_ide = Column(Integer, nullable=True)
     fetched_at_utc = Column(String(64), nullable=False)
 
-    # cascade="all, delete-orphan" + passive_deletes=True:
-    # al borrar un contrato (p.ej. al reemplazar cabeceras), las líneas
-    # caen a nivel BBDD por ON DELETE CASCADE. SQLAlchemy NO emite
-    # DELETEs explícitos por línea (passive_deletes=True).
+    # cascade + passive_deletes: al borrar un contrato, las líneas caen
+    # a nivel BBDD por ON DELETE CASCADE. SQLAlchemy no emite DELETEs
+    # explícitos (passive_deletes=True).
     lines = relationship(
         "AlbaranContratoLineMergeOrm",
         back_populates="contrato",
@@ -69,13 +73,10 @@ class AlbaranContratoMergeOrm(Base):
 class AlbaranContratoLineMergeOrm(Base):
     """Líneas de detalle (``ctrpro``) de un contrato de cabecera.
 
-    Clave de agrupación: ``contrato_id`` (FK a ``albaran_contratos_merge.id``).
-    ``codigo_contrato`` se duplica aquí aunque sea redundante — facilita
-    consultas directas sin JOIN cuando se quieren ver las líneas de un
-    código concreto.
+    Incluye la partida (``obrparpar.cod`` / ``obrparpar.res``) a la que
+    se imputa la línea en el desglose de obra.
 
-    Cascada: ``ondelete="CASCADE"`` a nivel BBDD garantiza que al borrar
-    una cabecera, las líneas se eliminan sin necesidad de lógica aplicativa.
+    Cascada: ``ondelete="CASCADE"`` a nivel BBDD.
     """
 
     __tablename__ = "albaran_contrato_lines_merge"
@@ -104,6 +105,8 @@ class AlbaranContratoLineMergeOrm(Base):
     importe_linea = Column(Float, nullable=True)
     cuota_iva = Column(Float, nullable=True)
     doc_origen = Column(String(64), nullable=True)
+    codigo_partida = Column(String(64), nullable=True)
+    descripcion_partida = Column(Text, nullable=True)
     fetched_at_utc = Column(String(64), nullable=False)
 
     contrato = relationship(
@@ -115,5 +118,9 @@ class AlbaranContratoLineMergeOrm(Base):
         Index(
             "ix_albaran_contrato_lines_merge_codigo",
             "codigo_contrato",
+        ),
+        Index(
+            "ix_albaran_contrato_lines_merge_partida",
+            "codigo_partida",
         ),
     )

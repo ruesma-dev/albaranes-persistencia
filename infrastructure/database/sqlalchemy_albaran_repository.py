@@ -166,12 +166,31 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
 
         # Columna nueva: contrato seleccionado por el usuario (o auto-
-        # seleccionado si solo hay 1). Referencia soft (string, no FK):
-        # si el enrichment borra/recrea contratos por código, la selección
-        # sigue siendo válida mientras ese código exista.
+        # seleccionado si solo hay 1). Referencia soft (string, no FK).
         alter_statements.append(
             "ALTER TABLE albaran_documents_merge "
             "ADD COLUMN IF NOT EXISTS selected_contrato_codigo VARCHAR(64)"
+        )
+
+        # Columnas nuevas en contratos (schema evolutivo).
+        # ``gra_rep_ide``: id del PDF en ruesma_rep.gra (para descarga).
+        alter_statements.append(
+            "ALTER TABLE albaran_contratos_merge "
+            "ADD COLUMN IF NOT EXISTS gra_rep_ide INTEGER"
+        )
+
+        # Columnas nuevas en líneas de contrato (partida).
+        alter_statements.extend(
+            [
+                (
+                    "ALTER TABLE albaran_contrato_lines_merge "
+                    "ADD COLUMN IF NOT EXISTS codigo_partida VARCHAR(64)"
+                ),
+                (
+                    "ALTER TABLE albaran_contrato_lines_merge "
+                    "ADD COLUMN IF NOT EXISTS descripcion_partida TEXT"
+                ),
+            ]
         )
 
         constraint_statements = [
@@ -191,15 +210,17 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_albaran_documents_sha_provider "
                 "ON albaran_documents (source_sha256, provider_origin)"
             ),
-            # Índice para las búsquedas de contratos por documento.
             (
                 "CREATE INDEX IF NOT EXISTS ix_albaran_contratos_merge_document "
                 "ON albaran_contratos_merge (document_id)"
             ),
-            # Índice para las búsquedas de líneas de contrato por cabecera.
             (
                 "CREATE INDEX IF NOT EXISTS ix_albaran_contrato_lines_merge_contrato "
                 "ON albaran_contrato_lines_merge (contrato_id)"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS ix_albaran_contrato_lines_merge_partida "
+                "ON albaran_contrato_lines_merge (codigo_partida)"
             ),
         ]
 
@@ -564,20 +585,14 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         document_id: str,
         contratos: list[ContratoEnrichmentResult],
     ) -> None:
-        """Reemplaza cabeceras de contrato y sus líneas de forma atómica.
+        """Reemplaza cabeceras + líneas de contrato atómicamente.
 
         Flujo:
           1) Verifica que el merge doc existe.
-          2) Borra todas las cabeceras previas del documento. Las líneas
-             caen en cascada a nivel BBDD (``ON DELETE CASCADE``).
-             Incluso así, si el esquema antiguo no tuviera la FK con
-             CASCADE, el delete manual de ``_delete_existing_records``
-             se encarga (en el flujo de save), y aquí al borrar por
-             document_id no quedan huérfanas porque también van por
-             contrato_id = id_cabecera (y esos ids desaparecen).
-          3) Inserta las cabeceras nuevas. Tras cada ``session.flush()``,
-             el atributo ``header_orm.id`` ya está asignado → insertamos
-             sus líneas con el FK correcto.
+          2) Borra cabeceras previas. Líneas caen por ON DELETE CASCADE.
+          3) Inserta cada cabecera con ``gra_rep_ide``, hace ``flush()``
+             para obtener el id autogenerado, e inserta sus líneas con
+             partida.
         """
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
@@ -586,8 +601,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             if merge_doc is None:
                 raise KeyError(f"Documento merge no encontrado: {document_id}")
 
-            # Borrado idempotente de los contratos previos.
-            # Las líneas asociadas caen por ON DELETE CASCADE de la FK.
             deleted = session.execute(
                 delete(AlbaranContratoMergeOrm).where(
                     AlbaranContratoMergeOrm.document_id == document_id
@@ -610,10 +623,11 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     nombre_proveedor=contrato.nombre_proveedor,
                     codigo_obra=contrato.codigo_obra,
                     nombre_obra=contrato.nombre_obra,
+                    gra_rep_ide=contrato.gra_rep_ide,
                     fetched_at_utc=now,
                 )
                 session.add(header_orm)
-                session.flush()  # asigna header_orm.id para las líneas
+                session.flush()  # asigna header_orm.id
 
                 for line in (contrato.lines or []):
                     session.add(
@@ -636,6 +650,8 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                             importe_linea=line.importe_linea,
                             cuota_iva=line.cuota_iva,
                             doc_origen=line.doc_origen,
+                            codigo_partida=line.codigo_partida,
+                            descripcion_partida=line.descripcion_partida,
                             fetched_at_utc=now,
                         )
                     )
@@ -644,11 +660,13 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             session.commit()
             logger.info(
                 "[contrato-enrichment][repo] replace_contratos: "
-                "document_id=%s borrados=%s contratos_insertados=%s lineas_insertadas=%s",
+                "document_id=%s borrados=%s contratos_insertados=%s "
+                "lineas_insertadas=%s pdfs=%s",
                 document_id,
                 deleted.rowcount if hasattr(deleted, "rowcount") else "?",
                 len(contratos),
                 total_lines_inserted,
+                sum(1 for c in contratos if c.gra_rep_ide is not None),
             )
 
     def set_selected_contrato(
@@ -659,10 +677,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
     ) -> None:
         self.initialize()
         with self._session_factory.create_session() as session:
-            # Usamos UPDATE crudo porque la columna selected_contrato_codigo
-            # no está declarada en el ORM de AlbaranDocumentMergeOrm (lo cual
-            # evita forzar al usuario a modificar ese archivo). Sí existe en
-            # BBDD por la migración de _ensure_compatible_schema.
             session.execute(
                 text(
                     "UPDATE albaran_documents_merge "
@@ -686,9 +700,8 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
         ).all()
         for document in merge_docs:
-            # Los contratos se eliminan por FK ON DELETE CASCADE; aun así,
-            # por si la FK no se creó en esquemas antiguos, borramos manual.
-            # Las líneas de contrato caen en cascada con sus cabeceras.
+            # Los contratos (y sus líneas) caen en cascada; borramos
+            # manual por si la FK CASCADE no existiera en esquemas antiguos.
             session.execute(
                 delete(AlbaranContratoMergeOrm).where(
                     AlbaranContratoMergeOrm.document_id == document.id
