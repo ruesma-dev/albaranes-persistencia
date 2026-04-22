@@ -546,12 +546,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         *,
         document_id: str,
     ) -> dict[str, tuple[int | None, str | None, str | None]]:
-        """Mapa de PDFs ya subidos para los contratos de un documento.
-
-        Se llama ANTES del replace_contratos para saber qué ``gra_rep_ide``
-        y ``pdf_*`` teníamos, y poder evitar la descarga+subida si la
-        versión del PDF no cambió.
-        """
+        """Mapa de PDFs ya subidos para los contratos de un documento."""
         self.initialize()
         result: dict[str, tuple[int | None, str | None, str | None]] = {}
         with self._session_factory.create_session() as session:
@@ -567,19 +562,114 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 result[codigo] = (ide, rel_path, web_url)
         return result
 
+    def has_selected_contrato_with_lines(
+        self,
+        *,
+        document_id: str,
+    ) -> tuple[bool, str | None]:
+        """Devuelve (hay_contrato_con_lineas, codigo_contrato_seleccionado).
+
+        Se considera que el documento está "listo para valorar" si:
+          1. ``albaran_documents_merge.selected_contrato_codigo`` no es NULL.
+          2. Existe al menos una línea en ``albaran_contrato_lines_merge``
+             asociada a ese contrato del documento.
+
+        Este chequeo lo usa ``PersistAlbaranPipeline`` justo después del
+        enrichment de contratos para decidir si dispara o no el trigger
+        automático de valoración (servicio 6).
+        """
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT d.selected_contrato_codigo AS codigo "
+                    "FROM albaran_documents_merge d "
+                    "WHERE d.id = :document_id "
+                    "LIMIT 1"
+                ),
+                {"document_id": document_id},
+            ).mappings().first()
+            if row is None:
+                return False, None
+
+            codigo = row.get("codigo")
+            if not codigo:
+                return False, None
+
+            has_lines = session.execute(
+                text(
+                    "SELECT 1 "
+                    "FROM albaran_contratos_merge ch "
+                    "JOIN albaran_contrato_lines_merge cl "
+                    "  ON cl.contrato_id = ch.id "
+                    "WHERE ch.document_id = :document_id "
+                    "  AND ch.codigo_contrato = :codigo "
+                    "LIMIT 1"
+                ),
+                {"document_id": document_id, "codigo": codigo},
+            ).first()
+
+            return (has_lines is not None, str(codigo))
+
+    def get_selected_contrato_codigo(
+        self,
+        *,
+        document_id: str,
+    ) -> str | None:
+        """Devuelve selected_contrato_codigo del merge. KeyError si el
+        documento no existe (para que el endpoint PATCH responda 404)."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT selected_contrato_codigo AS codigo "
+                    "FROM albaran_documents_merge "
+                    "WHERE id = :document_id "
+                    "LIMIT 1"
+                ),
+                {"document_id": document_id},
+            ).mappings().first()
+            if row is None:
+                raise KeyError(
+                    f"Documento merge no encontrado: {document_id}"
+                )
+            codigo = row.get("codigo")
+            return str(codigo) if codigo else None
+
+    def contrato_exists_for_document(
+        self,
+        *,
+        document_id: str,
+        codigo_contrato: str,
+    ) -> bool:
+        """True si existe ``albaran_contratos_merge`` con ese par
+        (document_id, codigo_contrato). Usado por el endpoint PATCH para
+        evitar meter en BBDD un ``selected_contrato_codigo`` que apunte
+        a un contrato que el enrichment no encontró."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT 1 "
+                    "FROM albaran_contratos_merge "
+                    "WHERE document_id = :document_id "
+                    "  AND codigo_contrato = :codigo "
+                    "LIMIT 1"
+                ),
+                {
+                    "document_id": document_id,
+                    "codigo": codigo_contrato,
+                },
+            ).first()
+            return row is not None
+
     def replace_contratos(
         self,
         *,
         document_id: str,
         contratos: list[ContratoEnrichmentResult],
     ) -> None:
-        """Reemplaza cabeceras + líneas de contrato atómicamente.
-
-        Persiste ``gra_rep_ide`` + ``pdf_*`` si el DTO los trae (caso de
-        reutilización). Para los contratos nuevos, los ``pdf_*`` van
-        ``None`` y el orquestador los actualiza luego vía
-        ``update_contrato_pdf_paths``.
-        """
+        """Reemplaza cabeceras + líneas de contrato atómicamente."""
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
         with self._session_factory.create_session() as session:

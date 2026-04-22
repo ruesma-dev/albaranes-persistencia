@@ -1,0 +1,91 @@
+# PATCH — interface_adapters/api/app.py (servicio 3)
+# ===========================================================================
+# Tres cambios:
+#   (1) Imports nuevos.
+#   (2) Construcción del SelectContratoPipeline (wiring).
+#   (3) Endpoint PATCH /v1/albaranes/{document_id}/selected-contrato.
+# ===========================================================================
+
+
+# ----- (1) Imports ---------------------------------------------------------
+
+from dataclasses import asdict
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel
+
+from application.pipelines.select_contrato_pipeline import (
+    SelectContratoPipeline,
+    SelectContratoRequest,
+)
+
+
+# ----- (2) Wiring en build_app ---------------------------------------------
+#
+# Añade este bloque DESPUÉS de la construcción de ``valuation_trigger`` y
+# ANTES de ``pipeline = PersistAlbaranPipeline(...)`` (ya existente).
+
+    select_contrato_pipeline = SelectContratoPipeline(
+        repository=repository,
+        valuation_trigger=valuation_trigger,
+    )
+
+
+# ----- (3) Endpoint --------------------------------------------------------
+#
+# Añade este modelo Pydantic ANTES de build_app (al estilo de otros modelos
+# que pueda haber) o dentro del módulo. Y el endpoint dentro de build_app
+# junto a los otros ``@app.post/patch``.
+
+class SelectContratoBody(BaseModel):
+    codigo_contrato: Optional[str] = None
+    trigger_valuation: bool = True
+    wait_for_valuation: bool = False
+
+
+    @app.patch("/v1/albaranes/{document_id}/selected-contrato")
+    def patch_selected_contrato(
+        document_id: str,
+        body: SelectContratoBody,
+    ) -> Dict[str, Any]:
+        """Actualiza el contrato seleccionado del albarán y (opcional)
+        dispara la valoración.
+
+        Body:
+          - codigo_contrato: string del contrato, o null para deseleccionar.
+          - trigger_valuation: si True (default), dispara la valoración.
+          - wait_for_valuation:
+              False (default) → fire-and-forget contra /v1/valuation/run-async
+              True → bloqueante contra /v1/valuation/{doc}/re-run
+
+        Errores:
+          - 404 si el documento no existe.
+          - 400 si el contrato solicitado no existe para ese documento.
+          - 500 si falla la BBDD.
+        """
+        try:
+            result = select_contrato_pipeline.run(
+                SelectContratoRequest(
+                    document_id=document_id,
+                    codigo_contrato=body.codigo_contrato,
+                    trigger_valuation=body.trigger_valuation,
+                    wait_for_valuation=body.wait_for_valuation,
+                )
+            )
+            payload = asdict(result)
+            # asdict no sabe serializar bien dataclasses anidados con
+            # default None; aseguramos un dict JSON-serializable.
+            return payload
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Error en PATCH selected-contrato document_id=%s codigo=%s",
+                document_id, body.codigo_contrato,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error actualizando contrato seleccionado: {exc}",
+            ) from exc

@@ -1,0 +1,62 @@
+# PATCH — infrastructure/database/sqlalchemy_albaran_repository.py (servicio 3)
+# ===========================================================================
+# Añade estos DOS métodos a ``SqlAlchemyAlbaranRepository``. Ya tienes
+# ``set_selected_contrato`` del parche anterior/entrega previa; estos son
+# complementarios y los usa ``SelectContratoPipeline``.
+# ===========================================================================
+
+
+# ----- (1) Método para leer el valor actual --------------------------------
+
+    def get_selected_contrato_codigo(
+        self,
+        *,
+        document_id: str,
+    ) -> str | None:
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT selected_contrato_codigo AS codigo "
+                    "FROM albaran_documents_merge "
+                    "WHERE id = :document_id "
+                    "LIMIT 1"
+                ),
+                {"document_id": document_id},
+            ).mappings().first()
+            if row is None:
+                raise KeyError(
+                    f"Documento merge no encontrado: {document_id}"
+                )
+            codigo = row.get("codigo")
+            return str(codigo) if codigo else None
+
+
+# ----- (2) Validación: ¿existe ese contrato para ese documento? ------------
+
+    def contrato_exists_for_document(
+        self,
+        *,
+        document_id: str,
+        codigo_contrato: str,
+    ) -> bool:
+        """True si existe ``albaran_contratos_merge`` con ese par
+        (document_id, codigo_contrato). Usado por el endpoint PATCH para
+        evitar meter en BBDD un ``selected_contrato_codigo`` que apunte
+        a un contrato que el enrichment no encontró."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            row = session.execute(
+                text(
+                    "SELECT 1 "
+                    "FROM albaran_contratos_merge "
+                    "WHERE document_id = :document_id "
+                    "  AND codigo_contrato = :codigo "
+                    "LIMIT 1"
+                ),
+                {
+                    "document_id": document_id,
+                    "codigo": codigo_contrato,
+                },
+            ).first()
+            return row is not None

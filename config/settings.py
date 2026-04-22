@@ -78,7 +78,7 @@ class Settings(BaseSettings):
     service_version: str = Field("1.0.0", alias="SERVICE_VERSION")
 
     # ------------------------------------------------------------------ #
-    # Sigrid API — enriquecimiento de obra desde BBDD on-prem (Function)
+    # Sigrid API — enriquecimiento de obra/contrato desde BBDD on-prem
     # ------------------------------------------------------------------ #
     sigrid_api_base_url: str | None = Field(
         default=None,
@@ -99,6 +99,36 @@ class Settings(BaseSettings):
     obra_enrichment_enabled: bool = Field(
         True,
         alias="OBRA_ENRICHMENT_ENABLED",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Trigger automático de valoración (servicio 6)
+    #
+    # Al terminar /persist, el svc 3 hace POST fire-and-forget a
+    # /v1/valuation/run-async del servicio 6 si:
+    #   - valuation_trigger_enabled=True
+    #   - valuation_api_base_url no está vacío
+    #   - el documento tiene selected_contrato_codigo con líneas.
+    #
+    # El endpoint PATCH /v1/albaranes/{doc}/selected-contrato también
+    # usa el mismo cliente pero en modo síncrono si el front lo pide
+    # vía ``wait_for_valuation=true``. Por eso hay DOS timeouts.
+    # ------------------------------------------------------------------ #
+    valuation_api_base_url: str | None = Field(
+        default=None,
+        alias="VALUATION_API_BASE_URL",
+    )
+    valuation_trigger_enabled: bool = Field(
+        True,
+        alias="VALUATION_TRIGGER_ENABLED",
+    )
+    valuation_trigger_timeout_s: float = Field(
+        3.0,
+        alias="VALUATION_TRIGGER_TIMEOUT_S",
+    )
+    valuation_trigger_sync_timeout_s: float = Field(
+        300.0,
+        alias="VALUATION_TRIGGER_SYNC_TIMEOUT_S",
     )
 
     model_config = SettingsConfigDict(
@@ -165,4 +195,18 @@ class Settings(BaseSettings):
             (self.sigrid_api_base_url or "").strip()
             and (self.sigrid_api_function_key or "").strip()
             and (self.sigrid_api_database or "").strip()
+        )
+
+    @property
+    def valuation_trigger_configured(self) -> bool:
+        """True si el trigger automático puede construirse.
+
+        Si está a False (por flag o por base_url vacío), el pipeline
+        /persist termina sin disparar valoración y el endpoint PATCH
+        responde con ``valuation_triggered=false``. El front siempre
+        puede disparar manualmente pulsando 'Valorar'.
+        """
+        return bool(
+            self.valuation_trigger_enabled
+            and (self.valuation_api_base_url or "").strip()
         )

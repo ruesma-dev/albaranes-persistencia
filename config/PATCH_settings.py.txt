@@ -1,0 +1,49 @@
+# PATCH — config/settings.py (servicio 3)
+# ===========================================================================
+# Añade estas 3 líneas al bloque de campos de Settings (por ejemplo justo
+# después del bloque de variables obra_enrichment_enabled/sigrid_api_*).
+# ===========================================================================
+
+    # ------------------------------------------------------------------ #
+    # Trigger automático de valoración (servicio 6)                     #
+    # ------------------------------------------------------------------ #
+    # Base URL del servicio 6 (albaranes-valuation-persistence). El svc 3
+    # hará POST fire-and-forget a /v1/valuation/run-async tras persistir.
+    valuation_api_base_url: str | None = Field(
+        default=None,
+        alias="VALUATION_API_BASE_URL",
+    )
+    # Si está a False, el pipeline /persist no intenta disparar valoración
+    # aunque haya contrato con líneas. El front seguirá pudiendo disparar
+    # manualmente. Útil para entornos donde el svc 6 no está levantado.
+    valuation_trigger_enabled: bool = Field(
+        True,
+        alias="VALUATION_TRIGGER_ENABLED",
+    )
+    valuation_trigger_timeout_s: float = Field(
+        3.0,
+        alias="VALUATION_TRIGGER_TIMEOUT_S",
+    )
+
+
+# ===========================================================================
+# Y añade esta property al final de la clase Settings (junto a
+# ``sigrid_api_configured``):
+# ===========================================================================
+
+    @property
+    def valuation_trigger_configured(self) -> bool:
+        """True si el trigger automático puede construirse."""
+        return bool(
+            self.valuation_trigger_enabled
+            and (self.valuation_api_base_url or "").strip()
+        )
+
+
+# ===========================================================================
+# Y añade estas 3 líneas al .env del servicio 3:
+# ===========================================================================
+#
+# VALUATION_API_BASE_URL=http://127.0.0.1:8003
+# VALUATION_TRIGGER_ENABLED=true
+# VALUATION_TRIGGER_TIMEOUT_S=3.0

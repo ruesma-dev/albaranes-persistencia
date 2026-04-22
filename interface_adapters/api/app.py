@@ -4,13 +4,18 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 
 from application.pipelines.persist_albaran_pipeline import (
     PersistAlbaranPipeline,
     PersistAlbaranRequest,
+)
+from application.pipelines.select_contrato_pipeline import (
+    SelectContratoPipeline,
+    SelectContratoRequest,
 )
 from application.services.albaran_normalizer import AlbaranNormalizer
 from application.services.contrato_enrichment_service import (
@@ -18,6 +23,7 @@ from application.services.contrato_enrichment_service import (
 )
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from config.settings import Settings
+from infrastructure.clients.http_valuation_trigger import HttpValuationTrigger
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
@@ -31,6 +37,12 @@ from infrastructure.storage.sharepoint_document_storage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class SelectContratoBody(BaseModel):
+    codigo_contrato: Optional[str] = None
+    trigger_valuation: bool = True
+    wait_for_valuation: bool = False
 
 
 def build_app(settings: Settings) -> FastAPI:
@@ -59,7 +71,6 @@ def build_app(settings: Settings) -> FastAPI:
 
     # ------------------------------------------------------------------ #
     # Construcción del servicio de enriquecimiento de obra (Sigrid on-prem).
-    # Si faltan credenciales en .env, queda como None y el pipeline lo salta.
     # ------------------------------------------------------------------ #
     obra_enrichment_service: ObraEnrichmentService | None = None
     logger.info(
@@ -88,22 +99,13 @@ def build_app(settings: Settings) -> FastAPI:
     else:
         logger.warning(
             "[obra-enrichment][wiring] NO se crea ObraEnrichmentService. "
-            "Motivo: enabled=%s configured=%s. "
-            "Revisa SIGRID_API_BASE_URL / SIGRID_API_FUNCTION_KEY / "
-            "SIGRID_API_DATABASE / OBRA_ENRICHMENT_ENABLED en tu .env.",
+            "Motivo: enabled=%s configured=%s.",
             settings.obra_enrichment_enabled,
             settings.sigrid_api_configured,
         )
 
     # ------------------------------------------------------------------ #
     # Construcción del servicio de enriquecimiento de CONTRATOS.
-    # Reutiliza las credenciales Sigrid y el MISMO SharePointDocumentStorage
-    # del upload de albaranes para subir también los PDFs de contrato a
-    # <base>/<YYYY>/<MM>/contratos/ (descarga vía /api/documents/read).
-    #
-    # Flag independiente (contrato_enrichment_enabled): permite apagar
-    # SOLO el de contratos sin tocar el de obra. Por defecto True si no
-    # está definido en Settings (compatibilidad hacia atrás via getattr).
     # ------------------------------------------------------------------ #
     contrato_enrichment_service: ContratoEnrichmentService | None = None
     contrato_enabled_flag = getattr(
@@ -143,12 +145,47 @@ def build_app(settings: Settings) -> FastAPI:
             settings.sigrid_api_configured,
         )
 
+    # ------------------------------------------------------------------ #
+    # Trigger automático de valoración (servicio 6).
+    # Se cablea solo si hay URL configurada y el flag está activo. En
+    # cualquier otro caso queda a None y el pipeline lo salta con un log
+    # informativo — el front sigue pudiendo disparar manualmente.
+    # ------------------------------------------------------------------ #
+    valuation_trigger: HttpValuationTrigger | None = None
+    if settings.valuation_trigger_configured:
+        valuation_trigger = HttpValuationTrigger(
+            base_url=settings.valuation_api_base_url,
+            async_timeout_s=settings.valuation_trigger_timeout_s,
+            sync_timeout_s=settings.valuation_trigger_sync_timeout_s,
+        )
+        logger.info(
+            "[valuation-trigger][wiring] HttpValuationTrigger CREADO "
+            "base_url=%s async_timeout=%s sync_timeout=%s",
+            settings.valuation_api_base_url,
+            settings.valuation_trigger_timeout_s,
+            settings.valuation_trigger_sync_timeout_s,
+        )
+    else:
+        logger.warning(
+            "[valuation-trigger][wiring] NO se crea trigger. enabled=%s "
+            "base_url=%r. El svc 3 terminará /persist sin disparar "
+            "valoración. El front tendrá que pulsar 'Valorar' manualmente.",
+            settings.valuation_trigger_enabled,
+            settings.valuation_api_base_url,
+        )
+
     pipeline = PersistAlbaranPipeline(
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
         obra_enrichment_service=obra_enrichment_service,
         contrato_enrichment_service=contrato_enrichment_service,
+        valuation_trigger=valuation_trigger,
+    )
+
+    select_contrato_pipeline = SelectContratoPipeline(
+        repository=repository,
+        valuation_trigger=valuation_trigger,
     )
 
     app = FastAPI(
@@ -177,6 +214,9 @@ def build_app(settings: Settings) -> FastAPI:
                 contrato_enrichment_service is not None
                 and document_storage is not None
             ),
+            "valuation_trigger_enabled": settings.valuation_trigger_enabled,
+            "valuation_trigger_wired": valuation_trigger is not None,
+            "valuation_api_base_url": settings.valuation_api_base_url,
             "sigrid_api_base_url": settings.sigrid_api_base_url,
             "sigrid_api_database": settings.sigrid_api_database,
         }
@@ -224,6 +264,59 @@ def build_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=500,
                 detail=f"Error persistiendo albarán: {exc}",
+            ) from exc
+
+    @app.patch("/v1/albaranes/{document_id}/selected-contrato")
+    def patch_selected_contrato(
+        document_id: str,
+        body: SelectContratoBody,
+    ) -> Dict[str, Any]:
+        """Actualiza el contrato seleccionado del albarán y (opcional)
+        dispara la valoración.
+
+        Body:
+          - codigo_contrato: string del contrato, o null para deseleccionar.
+          - trigger_valuation: si True (default), dispara la valoración.
+          - wait_for_valuation:
+              False (default) → fire-and-forget contra /v1/valuation/run-async.
+                El PATCH responde inmediato; el front hace polling contra
+                GET /v1/valuation/{document_id} del servicio 6.
+              True → bloqueante contra /v1/valuation/{doc}/re-run.
+                El PATCH no responde hasta que la valoración ha terminado;
+                el front recibe el resumen en la misma llamada.
+
+        Errores:
+          - 404 si el documento no existe en albaran_documents_merge.
+          - 400 si el contrato solicitado no existe para ese documento.
+          - 500 si falla la BBDD.
+
+        El disparo de la valoración es best-effort: si el servicio 6 está
+        caído, el UPDATE se hace igualmente y la respuesta trae
+        ``valuation_triggered=false`` con el error concreto. El front puede
+        reintentar manualmente.
+        """
+        try:
+            result = select_contrato_pipeline.run(
+                SelectContratoRequest(
+                    document_id=document_id,
+                    codigo_contrato=body.codigo_contrato,
+                    trigger_valuation=body.trigger_valuation,
+                    wait_for_valuation=body.wait_for_valuation,
+                )
+            )
+            return asdict(result)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Error en PATCH selected-contrato document_id=%s codigo=%s",
+                document_id, body.codigo_contrato,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error actualizando contrato seleccionado: {exc}",
             ) from exc
 
     return app

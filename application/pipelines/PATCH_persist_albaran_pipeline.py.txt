@@ -1,0 +1,148 @@
+# PATCH — application/pipelines/persist_albaran_pipeline.py (servicio 3)
+# ===========================================================================
+#
+# Modificaciones necesarias:
+#   1) Añadir import de ValuationTrigger.
+#   2) Añadir parámetro valuation_trigger al __init__ (opcional).
+#   3) Añadir un paso _trigger_valuation_safely al final de run().
+#   4) Añadir el método _trigger_valuation_safely.
+#
+# ===========================================================================
+
+
+# ----- (1) Import a añadir junto al resto -----------------------------------
+
+from domain.ports.valuation_trigger_port import ValuationTrigger  # NUEVO
+
+
+# ----- (2) Modificar __init__ del PersistAlbaranPipeline --------------------
+#
+# Añade el parámetro opcional ``valuation_trigger`` (None por defecto)
+# y guárdalo como atributo. Debajo tienes la firma completa del __init__
+# ya modificada para que puedas sustituirla entera:
+
+    def __init__(
+        self,
+        *,
+        repository: AlbaranRepository,
+        document_storage: DocumentStorage,
+        normalizer: AlbaranNormalizer,
+        obra_enrichment_service: ObraEnrichmentService | None = None,
+        contrato_enrichment_service: ContratoEnrichmentService | None = None,
+        valuation_trigger: ValuationTrigger | None = None,   # NUEVO
+    ) -> None:
+        self._repository = repository
+        self._document_storage = document_storage
+        self._normalizer = normalizer
+        self._obra_enrichment_service = obra_enrichment_service
+        self._contrato_enrichment_service = contrato_enrichment_service
+        self._valuation_trigger = valuation_trigger           # NUEVO
+        logger.info(
+            "[pipeline] PersistAlbaranPipeline construido; "
+            "obra_enrichment=%s contrato_enrichment=%s "
+            "valuation_trigger=%s",
+            "PRESENTE" if obra_enrichment_service is not None else "None",
+            "PRESENTE" if contrato_enrichment_service is not None else "None",
+            "PRESENTE" if valuation_trigger is not None else "None",
+        )
+
+
+# ----- (3) Modificar run() --------------------------------------------------
+#
+# Al final del método run() existen dos llamadas:
+#
+#     self._enrich_obra_safely(merge_document_id=saved.document_id)
+#     self._enrich_contratos_safely(merge_document_id=saved.document_id)
+#
+# Añade JUSTO DESPUÉS (antes del ``return PersistAlbaranResult(...)``)
+# la siguiente línea:
+
+        self._trigger_valuation_safely(
+            merge_document_id=saved.document_id,
+        )
+
+# Y la misma llamada también en la rama del DUPLICADO (cuando
+# ``existing is not None``), porque si alguien re-sube el mismo albarán
+# y mientras tanto se ha cambiado algo en Sigrid, conviene intentar
+# la valoración por si ahora sí hay contrato. El código queda así
+# en esa rama (busca ``if existing is not None:``):
+
+        if existing is not None:
+            logger.info(
+                "Documento duplicado detectado. sha256=%s document_id=%s",
+                sha256,
+                existing.document_id,
+            )
+            self._enrich_obra_safely(merge_document_id=existing.document_id)
+            self._enrich_contratos_safely(merge_document_id=existing.document_id)
+            self._trigger_valuation_safely(                      # NUEVO
+                merge_document_id=existing.document_id,
+            )
+            return PersistAlbaranResult(
+                ok=True,
+                document_id=existing.document_id,
+                sharepoint_url=existing.sharepoint_url,
+                duplicate=True,
+                stored_lines=existing.stored_lines,
+            )
+
+
+# ----- (4) Método nuevo _trigger_valuation_safely ---------------------------
+#
+# Añádelo junto a los otros helpers _enrich_*_safely:
+
+    def _trigger_valuation_safely(self, *, merge_document_id: str) -> None:
+        """Dispara el servicio 6 solo si hay contrato seleccionado con líneas.
+
+        Es SIEMPRE best-effort: un fallo aquí no rompe la persistencia.
+        """
+        logger.info(
+            "[valuation-trigger][pipeline] pre-step: trigger_present=%s "
+            "merge_document_id=%s",
+            self._valuation_trigger is not None,
+            merge_document_id,
+        )
+        if self._valuation_trigger is None:
+            logger.info(
+                "[valuation-trigger][pipeline] SKIP: trigger no cableado."
+            )
+            return
+
+        try:
+            has_lines, codigo = self._repository.has_selected_contrato_with_lines(
+                document_id=merge_document_id,
+            )
+        except Exception:
+            logger.exception(
+                "[valuation-trigger][pipeline] Error comprobando líneas "
+                "contrato; se omite trigger. document_id=%s",
+                merge_document_id,
+            )
+            return
+
+        if not has_lines:
+            logger.info(
+                "[valuation-trigger][pipeline] SKIP: no hay contrato "
+                "seleccionado con líneas. document_id=%s codigo=%s",
+                merge_document_id, codigo,
+            )
+            return
+
+        try:
+            accepted = self._valuation_trigger.trigger_async(
+                document_id=merge_document_id,
+                codigo_contrato=codigo,
+                force=False,
+            )
+            logger.info(
+                "[valuation-trigger][pipeline] trigger resultado=%s "
+                "document_id=%s codigo=%s",
+                "ACCEPTED" if accepted else "REJECTED",
+                merge_document_id, codigo,
+            )
+        except Exception:
+            logger.exception(
+                "[valuation-trigger][pipeline] fallo inesperado al "
+                "disparar trigger. document_id=%s",
+                merge_document_id,
+            )
