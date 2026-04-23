@@ -43,6 +43,115 @@ DocumentOrmType = Type[AlbaranDocumentOrm] | Type[AlbaranDocumentMergeOrm]
 LineOrmType = Type[AlbaranLineOrm] | Type[AlbaranLineMergeOrm]
 
 
+# =============================================================================
+# DDL de VALORACIÓN (servicio 6). El servicio 3 lo ejecuta al crear la BBDD
+# para que queden las 9 tablas disponibles desde el arranque. Es idempotente
+# (CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS).
+# =============================================================================
+_VALUATION_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS albaran_valuations (
+        id                        VARCHAR(36) PRIMARY KEY,
+        document_id               VARCHAR(36) NOT NULL UNIQUE
+            REFERENCES albaran_documents_merge(id) ON DELETE CASCADE,
+        contrato_codigo           VARCHAR(64),
+        status                    VARCHAR(32) NOT NULL,
+        provider_ia               VARCHAR(32),
+        model_name                VARCHAR(100),
+        prompt_key                VARCHAR(100),
+        total_valorado            DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+        total_lines               INTEGER NOT NULL DEFAULT 0,
+        lines_matched_exact       INTEGER NOT NULL DEFAULT 0,
+        lines_matched_semantic    INTEGER NOT NULL DEFAULT 0,
+        lines_matched_price_only  INTEGER NOT NULL DEFAULT 0,
+        lines_unmatched           INTEGER NOT NULL DEFAULT 0,
+        review_required           BOOLEAN NOT NULL DEFAULT FALSE,
+        review_reasons_json       TEXT,
+        raw_ia_envelope_json      TEXT,
+        created_at_utc            VARCHAR(64) NOT NULL,
+        updated_at_utc            VARCHAR(64)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_document_id "
+    "ON albaran_valuations(document_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_status "
+    "ON albaran_valuations(status)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_valuations_contrato_codigo "
+    "ON albaran_valuations(contrato_codigo)",
+    """
+    CREATE TABLE IF NOT EXISTS contrato_lines_derived (
+        id                        SERIAL PRIMARY KEY,
+        created_by_valuation_id   VARCHAR(36) NOT NULL
+            REFERENCES albaran_valuations(id) ON DELETE CASCADE,
+        source_document_id        VARCHAR(36) NOT NULL,
+        codigo_contrato           VARCHAR(64) NOT NULL,
+        codigo_producto           VARCHAR(64),
+        descripcion_linea         TEXT,
+        unidad_medida             VARCHAR(32),
+        precio_unitario           DOUBLE PRECISION,
+        codigo_partida            VARCHAR(64),
+        origen                    VARCHAR(32) NOT NULL,
+        created_at_utc            VARCHAR(64) NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_created_by "
+    "ON contrato_lines_derived(created_by_valuation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_source_doc "
+    "ON contrato_lines_derived(source_document_id)",
+    "CREATE INDEX IF NOT EXISTS ix_contrato_lines_derived_producto_partida "
+    "ON contrato_lines_derived(codigo_contrato, codigo_producto, codigo_partida)",
+    """
+    CREATE TABLE IF NOT EXISTS albaran_line_valuations (
+        id                             SERIAL PRIMARY KEY,
+        valuation_id                   VARCHAR(36) NOT NULL
+            REFERENCES albaran_valuations(id) ON DELETE CASCADE,
+        merge_line_id                  INTEGER NOT NULL
+            REFERENCES albaran_lines_merge(id) ON DELETE CASCADE,
+        matched_contrato_line_id       INTEGER
+            REFERENCES albaran_contrato_lines_merge(id) ON DELETE SET NULL,
+        derived_contrato_line_id       INTEGER
+            REFERENCES contrato_lines_derived(id) ON DELETE SET NULL,
+        precio_unitario_contrato_db    DOUBLE PRECISION,
+        precio_unitario_pdf_inferido   DOUBLE PRECISION,
+        precio_unitario_final          DOUBLE PRECISION,
+        precio_unitario_source         VARCHAR(32) NOT NULL,
+        precio_unitario_agreement      VARCHAR(32) NOT NULL,
+        unidad_albaran                 VARCHAR(32),
+        unidad_contrato                VARCHAR(32),
+        unidad_categoria               VARCHAR(32) NOT NULL,
+        unidad_category_match          BOOLEAN NOT NULL,
+        cantidad_albaran               DOUBLE PRECISION,
+        cantidad_convertida            DOUBLE PRECISION,
+        factor_conversion              DOUBLE PRECISION,
+        importe_calculado              DOUBLE PRECISION,
+        importe_albaran_declarado      DOUBLE PRECISION,
+        importe_source                 VARCHAR(32) NOT NULL,
+        codigo_partida_albaran         VARCHAR(64),
+        codigo_partida_final           VARCHAR(64),
+        partida_action                 VARCHAR(32) NOT NULL,
+        match_confidence_pct           DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+        match_method                   VARCHAR(32) NOT NULL,
+        review_required                BOOLEAN NOT NULL DEFAULT FALSE,
+        review_reasons_json            TEXT,
+        ia_reasoning                   TEXT,
+        created_at_utc                 VARCHAR(64) NOT NULL,
+        CONSTRAINT uq_albaran_line_valuations_val_line
+            UNIQUE (valuation_id, merge_line_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_valuation_id "
+    "ON albaran_line_valuations(valuation_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_merge_line_id "
+    "ON albaran_line_valuations(merge_line_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_matched_contrato "
+    "ON albaran_line_valuations(matched_contrato_line_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_derived_contrato "
+    "ON albaran_line_valuations(derived_contrato_line_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_match_method "
+    "ON albaran_line_valuations(match_method)",
+)
+
+
 @dataclass(frozen=True)
 class RawProviderSpec:
     provider_origin: str
@@ -227,6 +336,34 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             for ddl in alter_statements + constraint_statements:
                 session.execute(text(ddl))
             session.commit()
+
+        # ---- NUEVO: DDL de VALORACIÓN (servicio 6) --------------------
+        # Cada sentencia en AUTOCOMMIT por separado: si una falla, no
+        # aborta el resto, y las que van OK se persisten de inmediato.
+        # Idempotente (CREATE ... IF NOT EXISTS).
+        engine = self._session_factory.engine
+        autocommit_engine = engine.execution_options(
+            isolation_level="AUTOCOMMIT",
+        )
+        logger.info(
+            "[svc3-ddl] Ejecutando %s sentencias DDL de valoración (svc 6)…",
+            len(_VALUATION_DDL),
+        )
+        for idx, ddl in enumerate(_VALUATION_DDL, start=1):
+            try:
+                with autocommit_engine.connect() as conn:
+                    conn.execute(text(ddl))
+            except Exception as exc:
+                logger.error(
+                    "[svc3-ddl]   [%2s/%2s] FALLO DDL valoración: %s",
+                    idx, len(_VALUATION_DDL), exc,
+                )
+                raise
+        logger.info(
+            "[svc3-ddl] DDL valoración OK (%s sentencias). Tablas: "
+            "albaran_valuations, albaran_line_valuations, contrato_lines_derived",
+            len(_VALUATION_DDL),
+        )
 
     def get_by_sha256(self, source_sha256: str) -> ExistingDocument | None:
         self.initialize()
