@@ -43,6 +43,35 @@ DocumentOrmType = Type[AlbaranDocumentOrm] | Type[AlbaranDocumentMergeOrm]
 LineOrmType = Type[AlbaranLineOrm] | Type[AlbaranLineMergeOrm]
 
 
+def _dump_contexto_linea(ctx) -> str | None:
+    """Serializa un ``ContextoLinea`` (o equivalente) a JSON string.
+
+    Usado al persistir líneas en ``albaran_lines`` y
+    ``albaran_lines_merge``. Tolera:
+      - ``None`` (la línea no es de familia compleja) → devuelve None.
+      - Un ``BaseModel`` Pydantic con ``model_dump()`` → usa exclude_none.
+      - Un dict (defensivo) → serializa filtrando Nones.
+      - Cualquier otra cosa → None (nunca lanza).
+
+    No guardamos ``{}`` — si el modelo no aporta nada, devolvemos None
+    para que la columna quede limpia.
+    """
+    if ctx is None:
+        return None
+    try:
+        data = ctx.model_dump(exclude_none=True)
+    except AttributeError:
+        if isinstance(ctx, dict):
+            data = {k: v for k, v in ctx.items() if v is not None}
+        else:
+            return None
+    except Exception:
+        return None
+    if not data:
+        return None
+    return json.dumps(data, ensure_ascii=False)
+
+
 # =============================================================================
 # DDL de VALORACIÓN (servicio 6). El servicio 3 lo ejecuta al crear la BBDD
 # para que queden las 9 tablas disponibles desde el arranque. Es idempotente
@@ -149,6 +178,20 @@ _VALUATION_DDL: tuple[str, ...] = (
     "ON albaran_line_valuations(derived_contrato_line_id)",
     "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_match_method "
     "ON albaran_line_valuations(match_method)",
+    # -----------------------------------------------------------------
+    # Sub-tanda 2C: columnas nuevas en albaran_line_valuations que
+    # persisten el contexto estructural derivado por el svc6.
+    # Idempotentes (IF NOT EXISTS). El svc6 también las crea en su
+    # propio _DDL_STATEMENTS como doble red de seguridad.
+    # -----------------------------------------------------------------
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS rol_linea VARCHAR(32)",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS ref_linea_base_merge_id INTEGER",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS tarifa_pdf_encontrada BOOLEAN",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS modifiers_applied_json TEXT",
 )
 
 
@@ -268,6 +311,16 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS line_match_score DOUBLE PRECISION",
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS comparison_status_json TEXT",
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS field_scores_json TEXT",
+                    # Unidad de medida por línea. Antes no se persistía
+                    # (el svc5 leía NULL::text y el prefilter la
+                    # clasificaba como 'unknown'). Ahora la guardamos
+                    # para que el valorador pueda trabajar con la
+                    # unidad real.
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS unidad_medida VARCHAR(32)",
+                    # Contexto estructural de la línea (familia hormigón /
+                    # combustible / alquiler_maquinaria / otro). Ver
+                    # domain/models/contexto_linea.py. Idempotente.
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS contexto_linea_json TEXT",
                 ]
             )
 
@@ -1116,6 +1169,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     codigo=line.codigo,
                     cantidad=line.cantidad,
                     concepto=line.concepto,
+                    unidad_medida=line.unidad_medida,
                     precio=line.precio,
                     descuento=line.descuento,
                     precio_neto=line.precio_neto,
@@ -1125,6 +1179,9 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     line_match_score=None,
                     comparison_status_json=None,
                     field_scores_json=None,
+                    contexto_linea_json=_dump_contexto_linea(
+                        getattr(line, "contexto_linea", None)
+                    ),
                 )
                 for index, line in enumerate(source_lines, start=1)
             ]
@@ -1139,6 +1196,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 codigo=result.merged_line.codigo,
                 cantidad=result.merged_line.cantidad,
                 concepto=result.merged_line.concepto,
+                unidad_medida=result.merged_line.unidad_medida,
                 precio=result.merged_line.precio,
                 descuento=result.merged_line.descuento,
                 precio_neto=result.merged_line.precio_neto,
@@ -1155,6 +1213,9 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     result.field_scores,
                     ensure_ascii=False,
                     indent=2,
+                ),
+                contexto_linea_json=_dump_contexto_linea(
+                    getattr(result.merged_line, "contexto_linea", None)
                 ),
             )
             for index, result in enumerate(line_results, start=1)

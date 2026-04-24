@@ -74,6 +74,12 @@ class _LineColumnsMixin:
     codigo: Mapped[str | None] = mapped_column(String(64))
     cantidad: Mapped[float | None] = mapped_column(Float)
     concepto: Mapped[str | None] = mapped_column(Text)
+    # -----------------------------------------------------------------
+    # Unidad de medida tal cual aparece en el albarán ('m3', 'kg',
+    # 'ud', 'min', 'h', etc.). String corto. Usado por svc5 para
+    # clasificar la categoría y por svc6 para convertir cantidades.
+    # -----------------------------------------------------------------
+    unidad_medida: Mapped[str | None] = mapped_column(String(32))
     precio: Mapped[float | None] = mapped_column(Float)
     descuento: Mapped[float | None] = mapped_column(Float)
     precio_neto: Mapped[float | None] = mapped_column(Float)
@@ -83,6 +89,16 @@ class _LineColumnsMixin:
     line_match_score: Mapped[float | None] = mapped_column(Float)
     comparison_status_json: Mapped[str | None] = mapped_column(Text)
     field_scores_json: Mapped[str | None] = mapped_column(Text)
+
+    # -----------------------------------------------------------------
+    # Contexto estructural de la línea (familia hormigón / combustible /
+    # alquiler_maquinaria / otro). Viene del OCR por el envelope y se
+    # persiste serializado como JSON. Null cuando la línea no es de
+    # familia compleja.
+    # Estructura: {tipo_familia, rol_linea, descripcion_extendida,
+    #              notas_tiempo, ref_linea_base}.
+    # -----------------------------------------------------------------
+    contexto_linea_json: Mapped[str | None] = mapped_column(Text)
 
 
 class AlbaranDocumentOrm(_DocumentColumnsMixin, Base):

@@ -9,6 +9,9 @@ from datetime import date
 from difflib import SequenceMatcher
 from typing import Any
 
+from application.services.contexto_linea_merger import (
+    pick_best_contexto_linea,
+)
 from domain.models.extraction_models import (
     CabeceraAlbaran,
     DocumentoAlbaran,
@@ -59,6 +62,7 @@ _LINE_CONFIGS: dict[str, dict[str, Any]] = {
     "codigo": {"weight": 5, "required": False, "critical": False, "kind": "identifier"},
     "cantidad": {"weight": 15, "required": True, "critical": True, "kind": "number", "tolerance": 0.05},
     "concepto": {"weight": 25, "required": True, "critical": True, "kind": "text"},
+    "unidad_medida": {"weight": 5, "required": False, "critical": False, "kind": "identifier"},
     "precio": {"weight": 10, "required": False, "critical": False, "kind": "number", "tolerance": 0.05},
     "descuento": {"weight": 5, "required": False, "critical": False, "kind": "number", "tolerance": 0.2},
     "precio_neto": {"weight": 20, "required": True, "critical": True, "kind": "number", "tolerance": 0.15},
@@ -790,6 +794,25 @@ class AlbaranConfidenceService:
             openai_line.confianza_pct if openai_line is not None else None
         )
         merged_payload["confianza_pct"] = raw_openai_conf
+
+        # Contexto estructural (familia hormigón / combustible /
+        # alquiler / otro). Elegimos el más rico de los tres
+        # proveedores. Regla detallada en contexto_linea_merger.py.
+        # No usamos _coalesce_triple porque contexto_linea es un
+        # objeto Pydantic compuesto, no un escalar — la lógica
+        # campo-a-campo no aplica.
+        merged_payload["contexto_linea"] = pick_best_contexto_linea(
+            openai_ctx=(
+                openai_line.contexto_linea if openai_line is not None else None
+            ),
+            gemini_ctx=(
+                gemini_line.contexto_linea if gemini_available else None
+            ),
+            claude_ctx=(
+                claude_line.contexto_linea if claude_available else None
+            ),
+        )
+
         merged_line = LineaAlbaran(**merged_payload)
 
         provider_origin = self._resolve_line_provider_origin(
