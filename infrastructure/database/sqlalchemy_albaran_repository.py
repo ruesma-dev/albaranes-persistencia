@@ -192,6 +192,37 @@ _VALUATION_DDL: tuple[str, ...] = (
     "ADD COLUMN IF NOT EXISTS tarifa_pdf_encontrada BOOLEAN",
     "ALTER TABLE albaran_line_valuations "
     "ADD COLUMN IF NOT EXISTS modifiers_applied_json TEXT",
+    # -----------------------------------------------------------------
+    # Sub-tanda 2D: soporte para LÍNEAS SINTÉTICAS.
+    # El valorador (svc5) puede generar líneas de valoración que no
+    # corresponden a líneas del albarán (modificadores de hormigón:
+    # año, consistencia, árido, etc.). Estas líneas llevan
+    # merge_line_id = NULL y parent_merge_line_id apunta a la base.
+    #
+    # Los 4 ALTER son idempotentes (IF NOT EXISTS / DROP NOT NULL).
+    # El svc6 también los aplica en su _DDL_STATEMENTS como doble
+    # red de seguridad.
+    # -----------------------------------------------------------------
+    # Hacemos merge_line_id nullable. En PostgreSQL ALTER COLUMN
+    # DROP NOT NULL es idempotente: si ya era nullable, no hace nada.
+    "ALTER TABLE albaran_line_valuations "
+    "ALTER COLUMN merge_line_id DROP NOT NULL",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS line_kind VARCHAR(32) "
+    "NOT NULL DEFAULT 'from_albaran'",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS parent_merge_line_id INTEGER",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS modifier_source VARCHAR(32)",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS modifier_reason TEXT",
+    "ALTER TABLE albaran_line_valuations "
+    "ADD COLUMN IF NOT EXISTS descripcion_linea TEXT",
+    # Índice para buscar rápido las sintéticas que cuelgan de una base.
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_parent "
+    "ON albaran_line_valuations(parent_merge_line_id)",
+    "CREATE INDEX IF NOT EXISTS ix_albaran_line_valuations_line_kind "
+    "ON albaran_line_valuations(line_kind)",
 )
 
 
