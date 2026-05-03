@@ -731,6 +731,15 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 return None
             return document.obra_codigo
 
+    def get_merge_fecha(self, *, document_id: str) -> str | None:
+        """Devuelve la fecha del albarán del merge en formato ISO."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                return None
+            return document.fecha
+
     def update_merge_obra_fields(
         self,
         *,

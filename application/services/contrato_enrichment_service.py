@@ -5,6 +5,7 @@ import logging
 
 from application.services.obra_code_normalizer import normalize_obra_code
 from domain.models.contrato_models import ContratoEnrichmentResult
+from domain.ports.contrato_cache_port import ContratoCachePort
 from domain.ports.contrato_enrichment_port import ContratoEnrichmentClient
 from domain.ports.contrato_merge_repository_port import ContratoMergeRepository
 from domain.ports.contrato_pdf_storage_port import ContratoPdfStorage
@@ -12,6 +13,31 @@ from domain.ports.contrato_pdf_storage_port import ContratoPdfStorage
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[contrato-enrichment]"
+
+
+def _fecha_iso_a_yyyymmdd(fecha_iso: str | None) -> int | None:
+    """Convierte una fecha en formato ISO ``YYYY-MM-DD`` al entero
+    ``YYYYMMDD`` que usa Sigrid en sus columnas de vigencia.
+
+    Tolera entradas con espacios y otros separadores raros
+    (``"2026/03/11"`` por ejemplo). Devuelve ``None`` si la fecha
+    no es interpretable como una fecha de 8 dígitos.
+    """
+    if not fecha_iso:
+        return None
+    cleaned = (
+        fecha_iso.strip()
+        .replace("-", "")
+        .replace("/", "")
+        .replace(".", "")
+        .replace(" ", "")
+    )
+    if len(cleaned) != 8 or not cleaned.isdigit():
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
 
 
 class ContratoEnrichmentService:
@@ -46,28 +72,49 @@ class ContratoEnrichmentService:
         *,
         client: ContratoEnrichmentClient,
         repository: ContratoMergeRepository,
+        cache: ContratoCachePort | None = None,
         pdf_storage: ContratoPdfStorage | None = None,
         enabled: bool = True,
     ) -> None:
         self._client = client
         self._repository = repository
+        self._cache = cache
         self._pdf_storage = pdf_storage
         self._enabled = enabled
         logger.info(
             "%s ContratoEnrichmentService INSTANCIADO "
-            "(enabled=%s client=%s repo=%s pdf_storage=%s)",
+            "(enabled=%s client=%s repo=%s cache=%s pdf_storage=%s)",
             _LOG_PREFIX,
             enabled,
             type(client).__name__,
             type(repository).__name__,
+            type(cache).__name__ if cache is not None else "None",
             type(pdf_storage).__name__ if pdf_storage is not None else "None",
         )
 
-    def enrich_merge_document(self, *, merge_document_id: str) -> int:
+    def enrich_merge_document(
+        self,
+        *,
+        merge_document_id: str,
+        force_refetch: bool = False,
+    ) -> int:
+        """Asegura que el merge document tiene contratos asociados.
+
+        Si ``force_refetch=False`` (por defecto): primero intenta hit
+        en la caché por ``(codigo_obra, cif_proveedor, fecha_albaran)``
+        usando vigencia. Si lo encuentra, copia el contrato cacheado
+        directamente a ``albaran_contratos_merge`` y termina sin tocar
+        Sigrid.
+
+        Si ``force_refetch=True`` (botón "refrescar contrato" del
+        front), siempre llama a Sigrid e ignora la caché para LECTURA,
+        pero igualmente actualiza la caché con los datos frescos.
+        """
         logger.info(
-            "%s enrich_merge_document() INVOCADO document_id=%s",
+            "%s enrich_merge_document() INVOCADO document_id=%s force_refetch=%s",
             _LOG_PREFIX,
             merge_document_id,
+            force_refetch,
         )
 
         if not self._enabled:
@@ -87,6 +134,36 @@ class ContratoEnrichmentService:
             )
             return 0
 
+        # ----------------------------------------------------------------
+        # Paso A — Cache lookup (si la caché está disponible y no se
+        # fuerza refetch).
+        # ----------------------------------------------------------------
+        if self._cache is not None and not force_refetch:
+            cached = self._try_cache_hit(
+                merge_document_id=merge_document_id,
+                codigo_obra=obra_norm,
+                cif_proveedor=cif_clean,
+            )
+            if cached is not None:
+                # Hit válido: el contrato ya está en albaran_contratos_merge.
+                # Auto-select si lo recuperado es exactamente uno (siempre
+                # lo es en cache hit: solo elegimos uno).
+                try:
+                    self._repository.set_selected_contrato(
+                        document_id=merge_document_id,
+                        codigo_contrato=cached.codigo_contrato,
+                    )
+                except Exception:
+                    logger.exception(
+                        "%s ERROR auto-seleccionando contrato cacheado.",
+                        _LOG_PREFIX,
+                    )
+                return 1
+            # Cache miss → continúa al flujo original (Sigrid).
+
+        # ----------------------------------------------------------------
+        # Paso B — Llamada a Sigrid (flujo original).
+        # ----------------------------------------------------------------
         try:
             contratos = self._client.fetch_contratos(
                 cif_proveedor=cif_clean,
@@ -191,6 +268,22 @@ class ContratoEnrichmentService:
                 ),
             )
 
+        # ----------------------------------------------------------------
+        # Paso C — Persistir en caché (mejora de rendimiento futura).
+        # Esta operación es best-effort: un fallo aquí no impide el
+        # éxito del enrichment porque ``albaran_contratos_merge`` ya
+        # tiene los datos.
+        # ----------------------------------------------------------------
+        if self._cache is not None and contratos:
+            try:
+                self._cache.upsert_contratos(contratos=contratos_with_maybe_reused)
+            except Exception:
+                logger.exception(
+                    "%s FALLO upsertando contratos en caché (no afecta "
+                    "al enrichment).",
+                    _LOG_PREFIX,
+                )
+
         # Paso 8: auto-selección si hay uno solo.
         if len(contratos) == 1:
             codigo = contratos[0].codigo_contrato
@@ -203,6 +296,116 @@ class ContratoEnrichmentService:
                 logger.exception("%s ERROR auto-seleccionando contrato.", _LOG_PREFIX)
 
         return len(contratos)
+
+    # ------------------------------------------------------------------ #
+    # Cache lookup helper
+    # ------------------------------------------------------------------ #
+    def _try_cache_hit(
+        self,
+        *,
+        merge_document_id: str,
+        codigo_obra: str,
+        cif_proveedor: str,
+    ) -> ContratoEnrichmentResult | None:
+        """Intenta servir el contrato desde caché. Si hay hit, copia el
+        contrato cacheado a ``albaran_contratos_merge`` con el
+        ``document_id`` actual y devuelve el contrato encontrado.
+
+        Devuelve ``None`` en cualquier caso de miss (incluyendo errores
+        de lectura, fecha del albarán no parseable o ausencia de
+        ``ContratoCachePort``).
+        """
+        # Necesitamos la fecha del albarán para evaluar la vigencia.
+        try:
+            fecha_iso = self._repository.get_merge_fecha(
+                document_id=merge_document_id,
+            )
+        except AttributeError:
+            # Fallback si el repositorio no tiene get_merge_fecha
+            # (compatibilidad hacia atrás): cache miss.
+            logger.info(
+                "%s repo.get_merge_fecha no disponible; sin cache. doc=%s",
+                _LOG_PREFIX,
+                merge_document_id,
+            )
+            return None
+        except Exception:
+            logger.exception(
+                "%s Fallo leyendo fecha del merge; cache miss. doc=%s",
+                _LOG_PREFIX,
+                merge_document_id,
+            )
+            return None
+
+        fecha_int = _fecha_iso_a_yyyymmdd(fecha_iso)
+        if fecha_int is None:
+            logger.info(
+                "%s fecha_albaran no parseable (%r); cache miss. doc=%s",
+                _LOG_PREFIX,
+                fecha_iso,
+                merge_document_id,
+            )
+            return None
+
+        try:
+            assert self._cache is not None
+            cached = self._cache.find_active_contrato(
+                codigo_obra=codigo_obra,
+                cif_proveedor=cif_proveedor,
+                fecha_albaran_yyyymmdd=fecha_int,
+            )
+        except Exception:
+            logger.exception(
+                "%s Fallo consultando caché; se delega a Sigrid. doc=%s",
+                _LOG_PREFIX,
+                merge_document_id,
+            )
+            return None
+
+        if cached is None:
+            logger.info(
+                "%s CACHE MISS obra=%s cif=%s fecha=%s. doc=%s",
+                _LOG_PREFIX,
+                codigo_obra,
+                cif_proveedor,
+                fecha_int,
+                merge_document_id,
+            )
+            return None
+
+        # Hit: copiamos el contrato cacheado al merge usando
+        # replace_contratos. Reusamos los paths del PDF si los tenía
+        # cacheados (en cuyo caso ahorramos la subida a SharePoint).
+        logger.info(
+            "%s CACHE HIT obra=%s cif=%s fecha=%s -> codigo=%s "
+            "vigencia=[%s, %s] fecha_alta=%s gra_rep_ide=%s pdf_path=%s. doc=%s",
+            _LOG_PREFIX,
+            codigo_obra,
+            cif_proveedor,
+            fecha_int,
+            cached.codigo_contrato,
+            cached.vigencia_desde,
+            cached.vigencia_hasta,
+            cached.fecha_alta_contrato,
+            cached.gra_rep_ide,
+            cached.pdf_sharepoint_relative_path,
+            merge_document_id,
+        )
+
+        try:
+            self._repository.replace_contratos(
+                document_id=merge_document_id,
+                contratos=[cached],
+            )
+        except Exception:
+            logger.exception(
+                "%s FALLO escribiendo contrato cacheado al merge. doc=%s",
+                _LOG_PREFIX,
+                merge_document_id,
+            )
+            return None
+
+        return cached
 
     def _download_and_store_pdf(
         self,
