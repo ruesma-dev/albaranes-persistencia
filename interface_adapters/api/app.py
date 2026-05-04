@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -28,6 +28,9 @@ from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
 )
+from infrastructure.database.sqlalchemy_contrato_cache_repository import (
+    SqlAlchemyContratoCacheRepository,
+)
 from infrastructure.sigrid.sigrid_api_contrato_client import (
     SigridApiContratoClient,
 )
@@ -39,13 +42,25 @@ from infrastructure.storage.sharepoint_document_storage import (
 logger = logging.getLogger(__name__)
 
 
-class SelectContratoBody(BaseModel):
-    codigo_contrato: Optional[str] = None
+# =============================================================== #
+# DTOs internos del API
+# =============================================================== #
+class SelectedContratoPatch(BaseModel):
+    """Body del PATCH /v1/albaranes/{id}/selected-contrato.
+
+    Mantenido para compatibilidad con sv4 actual, aunque con el
+    orquestador desplegado, sv4 emite directamente eventos a sv7
+    en lugar de llamar a este endpoint.
+    """
+    codigo_contrato: str | None = None
     trigger_valuation: bool = True
     wait_for_valuation: bool = False
 
 
 def build_app(settings: Settings) -> FastAPI:
+    # ----------------------------------------------------------- #
+    # Capa de persistencia.
+    # ----------------------------------------------------------- #
     session_factory = SessionFactory(
         database_url=settings.database_url,
         admin_database_url=settings.admin_database_url,
@@ -54,6 +69,13 @@ def build_app(settings: Settings) -> FastAPI:
     repository = SqlAlchemyAlbaranRepository(session_factory)
     repository.initialize()
 
+    # Caché de contratos (LRU + TTL en BBDD para evitar re-llamar
+    # a Sigrid en cada persist con la misma combinación obra+CIF).
+    contrato_cache = SqlAlchemyContratoCacheRepository(session_factory)
+
+    # ----------------------------------------------------------- #
+    # SharePoint storage (también implementa ContratoPdfStorage).
+    # ----------------------------------------------------------- #
     document_storage = SharePointDocumentStorage(
         graph_key=settings.graph_key,
         timeout_s=settings.http_timeout_s,
@@ -69,112 +91,86 @@ def build_app(settings: Settings) -> FastAPI:
         create_link=settings.sharepoint_create_link,
     )
 
-    # ------------------------------------------------------------------ #
-    # Construcción del servicio de enriquecimiento de obra (Sigrid on-prem).
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------- #
+    # Sigrid clients (obra + contrato).
+    # Si las 3 vars imprescindibles no están presentes, los enrichers
+    # se quedan en None y el pipeline las salta (best-effort).
+    # ----------------------------------------------------------- #
     obra_enrichment_service: ObraEnrichmentService | None = None
-    logger.info(
-        "[obra-enrichment][wiring] obra_enrichment_enabled=%s "
-        "sigrid_api_configured=%s base_url=%s database=%s",
-        settings.obra_enrichment_enabled,
-        settings.sigrid_api_configured,
-        settings.sigrid_api_base_url,
-        settings.sigrid_api_database,
-    )
-    if settings.obra_enrichment_enabled and settings.sigrid_api_configured:
+    contrato_enrichment_service: ContratoEnrichmentService | None = None
+
+    if settings.sigrid_configured:
+        logger.info(
+            "[svc3-wiring] Sigrid configurado base_url=%s database=%s "
+            "→ creando clientes Sigrid + enrichers",
+            settings.sigrid_api_base_url,
+            settings.sigrid_api_database,
+        )
+
         sigrid_obra_client = SigridApiObraClient(
             base_url=settings.sigrid_api_base_url,
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
         )
-        obra_enrichment_service = ObraEnrichmentService(
-            client=sigrid_obra_client,
-            repository=repository,
-            enabled=True,
-        )
-        logger.info(
-            "[obra-enrichment][wiring] ObraEnrichmentService CREADO y listo."
-        )
-    else:
-        logger.warning(
-            "[obra-enrichment][wiring] NO se crea ObraEnrichmentService. "
-            "Motivo: enabled=%s configured=%s.",
-            settings.obra_enrichment_enabled,
-            settings.sigrid_api_configured,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Construcción del servicio de enriquecimiento de CONTRATOS.
-    # ------------------------------------------------------------------ #
-    contrato_enrichment_service: ContratoEnrichmentService | None = None
-    contrato_enabled_flag = getattr(
-        settings, "contrato_enrichment_enabled", True
-    )
-    logger.info(
-        "[contrato-enrichment][wiring] contrato_enrichment_enabled=%s "
-        "sigrid_api_configured=%s base_url=%s database=%s",
-        contrato_enabled_flag,
-        settings.sigrid_api_configured,
-        settings.sigrid_api_base_url,
-        settings.sigrid_api_database,
-    )
-    if contrato_enabled_flag and settings.sigrid_api_configured:
-        contrato_client = SigridApiContratoClient(
+        sigrid_contrato_client = SigridApiContratoClient(
             base_url=settings.sigrid_api_base_url,
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
+            database_rep=settings.sigrid_api_database_rep,
+            pdf_timeout_s=settings.sigrid_api_pdf_timeout_s,
+        )
+
+        obra_enrichment_service = ObraEnrichmentService(
+            client=sigrid_obra_client,
+            repository=repository,
+            enabled=settings.obra_enrichment_enabled,
         )
         contrato_enrichment_service = ContratoEnrichmentService(
-            client=contrato_client,
+            client=sigrid_contrato_client,
             repository=repository,
+            cache=contrato_cache,
             pdf_storage=document_storage,
             enabled=True,
         )
-        logger.info(
-            "[contrato-enrichment][wiring] ContratoEnrichmentService CREADO "
-            "(pdf_storage=%s).",
-            type(document_storage).__name__,
-        )
     else:
         logger.warning(
-            "[contrato-enrichment][wiring] NO se crea ContratoEnrichmentService. "
-            "Motivo: enabled=%s configured=%s.",
-            contrato_enabled_flag,
-            settings.sigrid_api_configured,
+            "[svc3-wiring] Sigrid NO configurado (faltan SIGRID_API_BASE_URL/"
+            "FUNCTION_KEY/DATABASE). Los enrichers de obra y contrato "
+            "quedan DESACTIVADOS — los albaranes se persistirán sin "
+            "buscar contratos en el ERP."
         )
 
-    # ------------------------------------------------------------------ #
-    # Trigger automático de valoración (servicio 6).
-    # Se cablea solo si hay URL configurada y el flag está activo. En
-    # cualquier otro caso queda a None y el pipeline lo salta con un log
-    # informativo — el front sigue pudiendo disparar manualmente.
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------- #
+    # Valuation trigger (sv3 → sv6).
+    # Por defecto DESACTIVADO porque sv7 orquesta. Solo se cablea si
+    # VALUATION_TRIGGER_ENABLED=true y hay base_url, como mecanismo
+    # de rollback o despliegue sin orquestador.
+    # ----------------------------------------------------------- #
     valuation_trigger: HttpValuationTrigger | None = None
     if settings.valuation_trigger_configured:
+        logger.warning(
+            "[svc3-wiring] VALUATION_TRIGGER_ENABLED=true → sv3 disparará "
+            "sv6 directamente. CUIDADO: si sv7 también está activo y "
+            "orquestando, podrías tener doble valoración. Recomendado: "
+            "VALUATION_TRIGGER_ENABLED=false cuando sv7 esté desplegado."
+        )
         valuation_trigger = HttpValuationTrigger(
             base_url=settings.valuation_api_base_url,
             async_timeout_s=settings.valuation_trigger_timeout_s,
             sync_timeout_s=settings.valuation_trigger_sync_timeout_s,
         )
-        logger.info(
-            "[valuation-trigger][wiring] HttpValuationTrigger CREADO "
-            "base_url=%s async_timeout=%s sync_timeout=%s",
-            settings.valuation_api_base_url,
-            settings.valuation_trigger_timeout_s,
-            settings.valuation_trigger_sync_timeout_s,
-        )
     else:
-        logger.warning(
-            "[valuation-trigger][wiring] NO se crea trigger. enabled=%s "
-            "base_url=%r. El svc 3 terminará /persist sin disparar "
-            "valoración. El front tendrá que pulsar 'Valorar' manualmente.",
-            settings.valuation_trigger_enabled,
-            settings.valuation_api_base_url,
+        logger.info(
+            "[svc3-wiring] valuation_trigger DESACTIVADO "
+            "(sv7 es quien orquesta la valoración tras el persist)"
         )
 
-    pipeline = PersistAlbaranPipeline(
+    # ----------------------------------------------------------- #
+    # Pipelines.
+    # ----------------------------------------------------------- #
+    persist_pipeline = PersistAlbaranPipeline(
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
@@ -182,12 +178,14 @@ def build_app(settings: Settings) -> FastAPI:
         contrato_enrichment_service=contrato_enrichment_service,
         valuation_trigger=valuation_trigger,
     )
-
     select_contrato_pipeline = SelectContratoPipeline(
         repository=repository,
         valuation_trigger=valuation_trigger,
     )
 
+    # ----------------------------------------------------------- #
+    # FastAPI app.
+    # ----------------------------------------------------------- #
     app = FastAPI(
         title="Albaranes Persistence API",
         version=settings.service_version,
@@ -206,19 +204,15 @@ def build_app(settings: Settings) -> FastAPI:
             "sharepoint_folder_root": settings.sharepoint_folder_root,
             "sharepoint_folder_url": settings.sharepoint_folder_url,
             "sharepoint_site_path": settings.sharepoint_site_path,
-            "obra_enrichment_enabled": settings.obra_enrichment_enabled,
-            "obra_enrichment_wired": obra_enrichment_service is not None,
-            "contrato_enrichment_enabled": contrato_enabled_flag,
-            "contrato_enrichment_wired": contrato_enrichment_service is not None,
-            "contrato_pdf_storage_wired": (
-                contrato_enrichment_service is not None
-                and document_storage is not None
+            "sigrid_configured": settings.sigrid_configured,
+            "obra_enrichment_enabled": (
+                obra_enrichment_service is not None
+                and settings.obra_enrichment_enabled
             ),
-            "valuation_trigger_enabled": settings.valuation_trigger_enabled,
-            "valuation_trigger_wired": valuation_trigger is not None,
-            "valuation_api_base_url": settings.valuation_api_base_url,
-            "sigrid_api_base_url": settings.sigrid_api_base_url,
-            "sigrid_api_database": settings.sigrid_api_database,
+            "contrato_enrichment_enabled": (
+                contrato_enrichment_service is not None
+            ),
+            "valuation_trigger_enabled": settings.valuation_trigger_configured,
         }
 
     @app.post("/v1/albaranes/persist")
@@ -248,7 +242,7 @@ def build_app(settings: Settings) -> FastAPI:
             ) from exc
 
         try:
-            result = pipeline.run(
+            result = persist_pipeline.run(
                 PersistAlbaranRequest(
                     filename=file.filename or "document.bin",
                     mime_type=file.content_type or "application/octet-stream",
@@ -261,6 +255,7 @@ def build_app(settings: Settings) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
+            logger.exception("Error persistiendo albarán")
             raise HTTPException(
                 status_code=500,
                 detail=f"Error persistiendo albarán: {exc}",
@@ -269,54 +264,39 @@ def build_app(settings: Settings) -> FastAPI:
     @app.patch("/v1/albaranes/{document_id}/selected-contrato")
     def patch_selected_contrato(
         document_id: str,
-        body: SelectContratoBody,
+        payload: SelectedContratoPatch,
     ) -> Dict[str, Any]:
-        """Actualiza el contrato seleccionado del albarán y (opcional)
-        dispara la valoración.
+        """Cambia el contrato seleccionado del documento.
 
-        Body:
-          - codigo_contrato: string del contrato, o null para deseleccionar.
-          - trigger_valuation: si True (default), dispara la valoración.
-          - wait_for_valuation:
-              False (default) → fire-and-forget contra /v1/valuation/run-async.
-                El PATCH responde inmediato; el front hace polling contra
-                GET /v1/valuation/{document_id} del servicio 6.
-              True → bloqueante contra /v1/valuation/{doc}/re-run.
-                El PATCH no responde hasta que la valoración ha terminado;
-                el front recibe el resumen en la misma llamada.
-
-        Errores:
-          - 404 si el documento no existe en albaran_documents_merge.
-          - 400 si el contrato solicitado no existe para ese documento.
-          - 500 si falla la BBDD.
-
-        El disparo de la valoración es best-effort: si el servicio 6 está
-        caído, el UPDATE se hace igualmente y la respuesta trae
-        ``valuation_triggered=false`` con el error concreto. El front puede
-        reintentar manualmente.
+        NOTA: con sv7 desplegado, sv4 emite eventos directos al
+        orquestador en lugar de llamar a este endpoint. El endpoint
+        se mantiene por compatibilidad y para casos de pruebas
+        manuales / scripts. El flag ``trigger_valuation`` solo tiene
+        efecto si el HttpValuationTrigger está cableado (es decir,
+        VALUATION_TRIGGER_ENABLED=true).
         """
         try:
             result = select_contrato_pipeline.run(
                 SelectContratoRequest(
                     document_id=document_id,
-                    codigo_contrato=body.codigo_contrato,
-                    trigger_valuation=body.trigger_valuation,
-                    wait_for_valuation=body.wait_for_valuation,
+                    codigo_contrato=payload.codigo_contrato,
+                    trigger_valuation=payload.trigger_valuation,
+                    wait_for_valuation=payload.wait_for_valuation,
                 )
             )
             return asdict(result)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception(
-                "Error en PATCH selected-contrato document_id=%s codigo=%s",
-                document_id, body.codigo_contrato,
+                "Error en select-contrato document_id=%s",
+                document_id,
             )
             raise HTTPException(
                 status_code=500,
-                detail=f"Error actualizando contrato seleccionado: {exc}",
+                detail=f"Error: {exc}",
             ) from exc
 
     return app

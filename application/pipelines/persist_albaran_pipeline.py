@@ -33,11 +33,26 @@ class PersistAlbaranRequest:
 
 @dataclass(frozen=True)
 class PersistAlbaranResult:
+    """Resultado del persist + enrichment.
+
+    Campos NUEVOS añadidos para que el orquestador (sv7) pueda decidir
+    el siguiente paso (valoración o esperar al revisor) sin tener que
+    consultar BBDD él mismo:
+
+      - ``contratos_count``: nº de contratos persistidos en
+        albaran_contratos_merge para este documento (después del
+        enrichment).
+      - ``selected_contrato_codigo``: código auto-seleccionado por el
+        ContratoEnrichmentService cuando hay exactamente 1 contrato.
+        ``None`` si hay 0 ó >1 contratos (o si el enrichment falló).
+    """
     ok: bool
     document_id: str
     sharepoint_url: str | None
     duplicate: bool
     stored_lines: int
+    contratos_count: int = 0
+    selected_contrato_codigo: str | None = None
 
 
 class PersistAlbaranPipeline:
@@ -84,8 +99,13 @@ class PersistAlbaranPipeline:
             # Re-enriquecer para idempotencia: si la BBDD on-prem cambió,
             # el merge se actualiza. No duplica contratos (replace).
             self._enrich_obra_safely(merge_document_id=existing.document_id)
-            self._enrich_contratos_safely(merge_document_id=existing.document_id)
+            contratos_count = self._enrich_contratos_safely(
+                merge_document_id=existing.document_id,
+            )
             self._trigger_valuation_safely(
+                merge_document_id=existing.document_id,
+            )
+            selected_codigo = self._read_selected_contrato_safely(
                 merge_document_id=existing.document_id,
             )
             return PersistAlbaranResult(
@@ -94,6 +114,8 @@ class PersistAlbaranPipeline:
                 sharepoint_url=existing.sharepoint_url,
                 duplicate=True,
                 stored_lines=existing.stored_lines,
+                contratos_count=contratos_count,
+                selected_contrato_codigo=selected_codigo,
             )
 
         envelope = self._normalize(envelope)
@@ -150,8 +172,21 @@ class PersistAlbaranPipeline:
         #     dispara /run-async del servicio 6 (fire-and-forget).
         # Todos los pasos son best-effort y no rompen la persistencia.
         self._enrich_obra_safely(merge_document_id=saved.document_id)
-        self._enrich_contratos_safely(merge_document_id=saved.document_id)
+        contratos_count = self._enrich_contratos_safely(
+            merge_document_id=saved.document_id,
+        )
         self._trigger_valuation_safely(merge_document_id=saved.document_id)
+        selected_codigo = self._read_selected_contrato_safely(
+            merge_document_id=saved.document_id,
+        )
+
+        logger.info(
+            "[pipeline] FIN persist document_id=%s duplicate=False "
+            "contratos_count=%d selected_contrato_codigo=%s",
+            saved.document_id,
+            contratos_count,
+            selected_codigo,
+        )
 
         return PersistAlbaranResult(
             ok=True,
@@ -159,6 +194,8 @@ class PersistAlbaranPipeline:
             sharepoint_url=saved.sharepoint_url,
             duplicate=False,
             stored_lines=saved.stored_lines,
+            contratos_count=contratos_count,
+            selected_contrato_codigo=selected_codigo,
         )
 
     def _enrich_obra_safely(self, *, merge_document_id: str) -> None:
@@ -184,7 +221,8 @@ class PersistAlbaranPipeline:
                 merge_document_id,
             )
 
-    def _enrich_contratos_safely(self, *, merge_document_id: str) -> None:
+    def _enrich_contratos_safely(self, *, merge_document_id: str) -> int:
+        """Devuelve el nº de contratos persistidos (0 si falló o no hay servicio)."""
         logger.info(
             "[contrato-enrichment][pipeline] pre-step: service_present=%s "
             "merge_document_id=%s",
@@ -195,17 +233,46 @@ class PersistAlbaranPipeline:
             logger.warning(
                 "[contrato-enrichment][pipeline] SKIP: no hay servicio wire-ado."
             )
-            return
+            return 0
         try:
-            self._contrato_enrichment_service.enrich_merge_document(
+            count = self._contrato_enrichment_service.enrich_merge_document(
                 merge_document_id=merge_document_id,
             )
+            return int(count) if count is not None else 0
         except Exception:
             logger.exception(
                 "[contrato-enrichment][pipeline] step falló; se continúa. "
                 "document_id=%s",
                 merge_document_id,
             )
+            return 0
+
+    def _read_selected_contrato_safely(
+        self,
+        *,
+        merge_document_id: str,
+    ) -> str | None:
+        """Lee selected_contrato_codigo del merge tras el enrichment.
+
+        ``ContratoEnrichmentService`` auto-selecciona el código en BBDD
+        cuando hay exactamente 1 contrato. Aquí lo leemos para incluirlo
+        en la respuesta del API y que el orquestador decida.
+        Best-effort: si falla, devolvemos None (sv7 entonces irá a
+        awaiting_contract_selection).
+        """
+        try:
+            return self._repository.get_selected_contrato_codigo(
+                document_id=merge_document_id,
+            )
+        except KeyError:
+            return None
+        except Exception:
+            logger.exception(
+                "[pipeline] no se pudo leer selected_contrato_codigo "
+                "tras el enrichment; se devuelve None. document_id=%s",
+                merge_document_id,
+            )
+            return None
 
     def _trigger_valuation_safely(self, *, merge_document_id: str) -> None:
         """Dispara el servicio 6 SOLO si hay contrato seleccionado con líneas.

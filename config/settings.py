@@ -16,6 +16,9 @@ SharePointMode = Literal["drive_id", "folder_url", "site_path"]
 class Settings(BaseSettings):
     graph_key: str = Field(..., alias="GRAPH_KEY")
 
+    # ----------------------------------------------------------- #
+    # SharePoint (igual que antes).
+    # ----------------------------------------------------------- #
     sharepoint_mode: SharePointMode = Field(
         "drive_id",
         alias="SHAREPOINT_MODE",
@@ -60,6 +63,9 @@ class Settings(BaseSettings):
         alias="SHAREPOINT_CREATE_LINK",
     )
 
+    # ----------------------------------------------------------- #
+    # PostgreSQL (igual que antes).
+    # ----------------------------------------------------------- #
     pg_host: str = Field("localhost", alias="PG_HOST")
     pg_port: int = Field(5432, alias="PG_PORT")
     pg_db: str = Field("albaranes", alias="PG_DB")
@@ -70,6 +76,9 @@ class Settings(BaseSettings):
     pg_admin_user: str = Field("postgres", alias="PG_ADMIN_USER")
     pg_admin_password: str = Field(..., alias="PG_ADMIN_PASSWORD")
 
+    # ----------------------------------------------------------- #
+    # API.
+    # ----------------------------------------------------------- #
     api_host: str = Field("127.0.0.1", alias="API_HOST")
     api_port: int = Field(8001, alias="API_PORT")
     http_timeout_s: int = Field(60, alias="HTTP_TIMEOUT_S")
@@ -77,9 +86,13 @@ class Settings(BaseSettings):
     log_dir: str = Field("logs", alias="LOG_DIR")
     service_version: str = Field("1.0.0", alias="SERVICE_VERSION")
 
-    # ------------------------------------------------------------------ #
-    # Sigrid API — enriquecimiento de obra/contrato desde BBDD on-prem
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------- #
+    # NUEVO — Sigrid API (estaba en .env.example pero no se cargaba).
+    # sv3 llama a Sigrid para enriquecer obra y para descargar
+    # contratos+PDFs. Si falta cualquiera, el enrichment se
+    # autodesactiva (ver app.py: si las 3 variables no están, no
+    # se construye el cliente y los enrichers quedan en None).
+    # ----------------------------------------------------------- #
     sigrid_api_base_url: str | None = Field(
         default=None,
         alias="SIGRID_API_BASE_URL",
@@ -88,39 +101,51 @@ class Settings(BaseSettings):
         default=None,
         alias="SIGRID_API_FUNCTION_KEY",
     )
-    sigrid_api_database: str = Field(
-        "ruesma",
+    sigrid_api_database: str | None = Field(
+        default=None,
         alias="SIGRID_API_DATABASE",
+    )
+    sigrid_api_database_rep: str = Field(
+        "ruesma_rep",
+        alias="SIGRID_API_DATABASE_REP",
     )
     sigrid_api_timeout_s: float = Field(
         30.0,
         alias="SIGRID_API_TIMEOUT_S",
     )
+    sigrid_api_pdf_timeout_s: float = Field(
+        120.0,
+        alias="SIGRID_API_PDF_TIMEOUT_S",
+    )
+
+    # Flag explícito para deshabilitar el enrichment de obra aunque
+    # la API esté configurada (útil para debug o entornos sin Sigrid).
     obra_enrichment_enabled: bool = Field(
         True,
         alias="OBRA_ENRICHMENT_ENABLED",
     )
 
-    # ------------------------------------------------------------------ #
-    # Trigger automático de valoración (servicio 6)
+    # ----------------------------------------------------------- #
+    # NUEVO — Valuation trigger (sv3 → sv6).
+    # IMPORTANTE: con el orquestador sv7 desplegado, lo HABITUAL es
+    # tener VALUATION_TRIGGER_ENABLED=false. Así sv3 NO dispara sv6
+    # directamente; sv7 es quien orquesta la valoración tras leer la
+    # respuesta del persist.
     #
-    # Al terminar /persist, el svc 3 hace POST fire-and-forget a
-    # /v1/valuation/run-async del servicio 6 si:
-    #   - valuation_trigger_enabled=True
-    #   - valuation_api_base_url no está vacío
-    #   - el documento tiene selected_contrato_codigo con líneas.
-    #
-    # El endpoint PATCH /v1/albaranes/{doc}/selected-contrato también
-    # usa el mismo cliente pero en modo síncrono si el front lo pide
-    # vía ``wait_for_valuation=true``. Por eso hay DOS timeouts.
-    # ------------------------------------------------------------------ #
+    # Lo dejamos activable por bandera por dos razones:
+    #  1. Permite rollback rápido si sv7 falla en producción.
+    #  2. Permite usar sv3 como "todo en uno" en entornos de
+    #     desarrollo donde no se quiere arrancar sv7.
+    # ----------------------------------------------------------- #
     valuation_api_base_url: str | None = Field(
         default=None,
         alias="VALUATION_API_BASE_URL",
     )
     valuation_trigger_enabled: bool = Field(
-        True,
+        False,
         alias="VALUATION_TRIGGER_ENABLED",
+        description="Si True y hay base_url, sv3 dispara sv6 al persistir. "
+                    "Por defecto False porque sv7 lo orquesta.",
     )
     valuation_trigger_timeout_s: float = Field(
         3.0,
@@ -169,6 +194,22 @@ class Settings(BaseSettings):
         )
 
     @property
+    def sigrid_configured(self) -> bool:
+        """True si las 3 variables imprescindibles de Sigrid están presentes."""
+        return bool(
+            (self.sigrid_api_base_url or "").strip()
+            and (self.sigrid_api_function_key or "").strip()
+            and (self.sigrid_api_database or "").strip()
+        )
+
+    @property
+    def valuation_trigger_configured(self) -> bool:
+        return bool(
+            self.valuation_trigger_enabled
+            and (self.valuation_api_base_url or "").strip()
+        )
+
+    @property
     def database_url(self) -> str:
         user = quote_plus(self.pg_user)
         password = quote_plus(self.pg_password)
@@ -186,27 +227,4 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{user}:{password}"
             f"@{self.pg_host}:{self.pg_port}/{database}"
-        )
-
-    @property
-    def sigrid_api_configured(self) -> bool:
-        """True si podemos construir el cliente Sigrid sin datos a medias."""
-        return bool(
-            (self.sigrid_api_base_url or "").strip()
-            and (self.sigrid_api_function_key or "").strip()
-            and (self.sigrid_api_database or "").strip()
-        )
-
-    @property
-    def valuation_trigger_configured(self) -> bool:
-        """True si el trigger automático puede construirse.
-
-        Si está a False (por flag o por base_url vacío), el pipeline
-        /persist termina sin disparar valoración y el endpoint PATCH
-        responde con ``valuation_triggered=false``. El front siempre
-        puede disparar manualmente pulsando 'Valorar'.
-        """
-        return bool(
-            self.valuation_trigger_enabled
-            and (self.valuation_api_base_url or "").strip()
         )
