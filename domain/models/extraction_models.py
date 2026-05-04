@@ -75,3 +75,10 @@ class ExtractionEnvelope(ProviderExtractionEnvelope):
     claude: ProviderExtractionEnvelope | None = None
     google_document_ai: ProviderExtractionEnvelope | None = None
     azure_document_intelligence: ProviderExtractionEnvelope | None = None
+
+    # Bloque opcional añadido por sv7 cuando hay revisión IA fase 2.
+    # Si está presente, sv3 lo lee con Phase2PersistenceService y lo
+    # persiste en albaran_documents_merge.review_phase2_*. Es un dict
+    # libre porque su forma la define sv7 (no tiene sentido validarlo
+    # estrictamente aquí — sv3 solo lo guarda como auditoría).
+    review_phase2_metadata: Dict[str, Any] | None = None

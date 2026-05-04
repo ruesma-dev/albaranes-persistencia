@@ -14,11 +14,21 @@ SharePointMode = Literal["drive_id", "folder_url", "site_path"]
 
 
 class Settings(BaseSettings):
+    """Configuración de sv3 (albaranes-persistence-api).
+
+    Bloques:
+      - Microsoft Graph + SharePoint (almacenamiento de PDFs).
+      - PostgreSQL (BBDD principal + admin).
+      - API (host/port).
+      - Sigrid API on-prem (enriquecimiento obra + contrato).
+      - Valuation trigger (sv6) — DESACTIVADO si lo orquesta sv7.
+    """
+
+    # ------------------------------------------------------------ #
+    # Microsoft Graph + SharePoint.
+    # ------------------------------------------------------------ #
     graph_key: str = Field(..., alias="GRAPH_KEY")
 
-    # ----------------------------------------------------------- #
-    # SharePoint (igual que antes).
-    # ----------------------------------------------------------- #
     sharepoint_mode: SharePointMode = Field(
         "drive_id",
         alias="SHAREPOINT_MODE",
@@ -63,9 +73,9 @@ class Settings(BaseSettings):
         alias="SHAREPOINT_CREATE_LINK",
     )
 
-    # ----------------------------------------------------------- #
-    # PostgreSQL (igual que antes).
-    # ----------------------------------------------------------- #
+    # ------------------------------------------------------------ #
+    # PostgreSQL.
+    # ------------------------------------------------------------ #
     pg_host: str = Field("localhost", alias="PG_HOST")
     pg_port: int = Field(5432, alias="PG_PORT")
     pg_db: str = Field("albaranes", alias="PG_DB")
@@ -76,9 +86,9 @@ class Settings(BaseSettings):
     pg_admin_user: str = Field("postgres", alias="PG_ADMIN_USER")
     pg_admin_password: str = Field(..., alias="PG_ADMIN_PASSWORD")
 
-    # ----------------------------------------------------------- #
-    # API.
-    # ----------------------------------------------------------- #
+    # ------------------------------------------------------------ #
+    # API + observabilidad.
+    # ------------------------------------------------------------ #
     api_host: str = Field("127.0.0.1", alias="API_HOST")
     api_port: int = Field(8001, alias="API_PORT")
     http_timeout_s: int = Field(60, alias="HTTP_TIMEOUT_S")
@@ -86,13 +96,13 @@ class Settings(BaseSettings):
     log_dir: str = Field("logs", alias="LOG_DIR")
     service_version: str = Field("1.0.0", alias="SERVICE_VERSION")
 
-    # ----------------------------------------------------------- #
-    # NUEVO — Sigrid API (estaba en .env.example pero no se cargaba).
-    # sv3 llama a Sigrid para enriquecer obra y para descargar
-    # contratos+PDFs. Si falta cualquiera, el enrichment se
-    # autodesactiva (ver app.py: si las 3 variables no están, no
-    # se construye el cliente y los enrichers quedan en None).
-    # ----------------------------------------------------------- #
+    # ------------------------------------------------------------ #
+    # Sigrid API on-prem (Function App de Azure).
+    # Si las 3 credenciales están presentes, se cablean los servicios
+    # ObraEnrichmentService y ContratoEnrichmentService. Si falta
+    # alguna, sv3 arranca pero ese enriquecimiento queda desactivado
+    # (best-effort).
+    # ------------------------------------------------------------ #
     sigrid_api_base_url: str | None = Field(
         default=None,
         alias="SIGRID_API_BASE_URL",
@@ -105,38 +115,23 @@ class Settings(BaseSettings):
         default=None,
         alias="SIGRID_API_DATABASE",
     )
-    sigrid_api_database_rep: str = Field(
-        "ruesma_rep",
-        alias="SIGRID_API_DATABASE_REP",
-    )
     sigrid_api_timeout_s: float = Field(
         30.0,
         alias="SIGRID_API_TIMEOUT_S",
     )
-    sigrid_api_pdf_timeout_s: float = Field(
-        120.0,
-        alias="SIGRID_API_PDF_TIMEOUT_S",
-    )
-
-    # Flag explícito para deshabilitar el enrichment de obra aunque
-    # la API esté configurada (útil para debug o entornos sin Sigrid).
     obra_enrichment_enabled: bool = Field(
         True,
         alias="OBRA_ENRICHMENT_ENABLED",
     )
 
-    # ----------------------------------------------------------- #
-    # NUEVO — Valuation trigger (sv3 → sv6).
-    # IMPORTANTE: con el orquestador sv7 desplegado, lo HABITUAL es
-    # tener VALUATION_TRIGGER_ENABLED=false. Así sv3 NO dispara sv6
-    # directamente; sv7 es quien orquesta la valoración tras leer la
-    # respuesta del persist.
+    # ------------------------------------------------------------ #
+    # Valuation trigger (sv6).
     #
-    # Lo dejamos activable por bandera por dos razones:
-    #  1. Permite rollback rápido si sv7 falla en producción.
-    #  2. Permite usar sv3 como "todo en uno" en entornos de
-    #     desarrollo donde no se quiere arrancar sv7.
-    # ----------------------------------------------------------- #
+    # IMPORTANTE: cuando el orquestador (sv7) está en producción,
+    # ESTE trigger debe estar a false porque el orquestador es quien
+    # llama al sv6. Si lo dejas a true, sv3 dispara la valoración
+    # nada más persistir y duplicas trabajo.
+    # ------------------------------------------------------------ #
     valuation_api_base_url: str | None = Field(
         default=None,
         alias="VALUATION_API_BASE_URL",
@@ -144,8 +139,6 @@ class Settings(BaseSettings):
     valuation_trigger_enabled: bool = Field(
         False,
         alias="VALUATION_TRIGGER_ENABLED",
-        description="Si True y hay base_url, sv3 dispara sv6 al persistir. "
-                    "Por defecto False porque sv7 lo orquesta.",
     )
     valuation_trigger_timeout_s: float = Field(
         3.0,
@@ -194,19 +187,12 @@ class Settings(BaseSettings):
         )
 
     @property
-    def sigrid_configured(self) -> bool:
-        """True si las 3 variables imprescindibles de Sigrid están presentes."""
+    def sigrid_credentials_present(self) -> bool:
+        """True si las 3 credenciales necesarias están presentes."""
         return bool(
             (self.sigrid_api_base_url or "").strip()
             and (self.sigrid_api_function_key or "").strip()
             and (self.sigrid_api_database or "").strip()
-        )
-
-    @property
-    def valuation_trigger_configured(self) -> bool:
-        return bool(
-            self.valuation_trigger_enabled
-            and (self.valuation_api_base_url or "").strip()
         )
 
     @property

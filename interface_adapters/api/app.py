@@ -1,4 +1,22 @@
 # interface_adapters/api/app.py
+"""Wiring completo del servicio 3 (albaranes-persistence-api).
+
+Construye y conecta:
+  - Repositorios SQLAlchemy: AlbaranRepository, ContratoCacheRepository.
+  - SharePointDocumentStorage (también cumple ContratoPdfStorage por
+    duck-typing — un solo storage cubre los dos tipos de subida).
+  - Sigrid clients + Enrichment services (obra y contrato).
+  - HttpValuationTrigger hacia sv6 (DESACTIVADO por defecto si lo
+    orquesta sv7 — controlable por ENV VALUATION_TRIGGER_ENABLED).
+  - Phase2PersistenceService (revisión IA fase 2 — UPDATE post-save).
+  - Pipeline PersistAlbaranPipeline con TODOS esos colaboradores.
+
+Los servicios opcionales (sigrid, valuation_trigger) se cablean
+solo si las credenciales / variables están presentes en .env. Si
+faltan, el pipeline arranca igual y los pasos correspondientes se
+loguean como SKIP. Así el sv3 nunca se rompe por una credencial
+ausente.
+"""
 from __future__ import annotations
 
 import json
@@ -7,23 +25,22 @@ from dataclasses import asdict
 from typing import Any, Dict
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
 
 from application.pipelines.persist_albaran_pipeline import (
     PersistAlbaranPipeline,
     PersistAlbaranRequest,
-)
-from application.pipelines.select_contrato_pipeline import (
-    SelectContratoPipeline,
-    SelectContratoRequest,
 )
 from application.services.albaran_normalizer import AlbaranNormalizer
 from application.services.contrato_enrichment_service import (
     ContratoEnrichmentService,
 )
 from application.services.obra_enrichment_service import ObraEnrichmentService
+from application.services.phase2_persistence_service import (
+    Phase2PersistenceService,
+)
 from config.settings import Settings
 from infrastructure.clients.http_valuation_trigger import HttpValuationTrigger
+from infrastructure.database.phase2_ddl import apply_phase2_ddl
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
@@ -42,24 +59,9 @@ from infrastructure.storage.sharepoint_document_storage import (
 logger = logging.getLogger(__name__)
 
 
-# =============================================================== #
-# DTOs internos del API
-# =============================================================== #
-class SelectedContratoPatch(BaseModel):
-    """Body del PATCH /v1/albaranes/{id}/selected-contrato.
-
-    Mantenido para compatibilidad con sv4 actual, aunque con el
-    orquestador desplegado, sv4 emite directamente eventos a sv7
-    en lugar de llamar a este endpoint.
-    """
-    codigo_contrato: str | None = None
-    trigger_valuation: bool = True
-    wait_for_valuation: bool = False
-
-
 def build_app(settings: Settings) -> FastAPI:
     # ----------------------------------------------------------- #
-    # Capa de persistencia.
+    # Persistencia (BBDD).
     # ----------------------------------------------------------- #
     session_factory = SessionFactory(
         database_url=settings.database_url,
@@ -68,13 +70,20 @@ def build_app(settings: Settings) -> FastAPI:
     )
     repository = SqlAlchemyAlbaranRepository(session_factory)
     repository.initialize()
-
-    # Caché de contratos (LRU + TTL en BBDD para evitar re-llamar
-    # a Sigrid en cada persist con la misma combinación obra+CIF).
     contrato_cache = SqlAlchemyContratoCacheRepository(session_factory)
 
     # ----------------------------------------------------------- #
-    # SharePoint storage (también implementa ContratoPdfStorage).
+    # Fase 2 (revisión IA): ALTER TABLE idempotente + servicio que
+    # hace el UPDATE post-save de los metadatos review_phase2_*.
+    # ----------------------------------------------------------- #
+    apply_phase2_ddl(session_factory)
+    phase2_service = Phase2PersistenceService(session_factory)
+
+    # ----------------------------------------------------------- #
+    # SharePoint storage. Sirve para:
+    #   - documentos de albarán (DocumentStorage)
+    #   - PDFs de contrato (ContratoPdfStorage por duck-typing)
+    # Una sola instancia que se inyecta en ambos puntos.
     # ----------------------------------------------------------- #
     document_storage = SharePointDocumentStorage(
         graph_key=settings.graph_key,
@@ -92,21 +101,13 @@ def build_app(settings: Settings) -> FastAPI:
     )
 
     # ----------------------------------------------------------- #
-    # Sigrid clients (obra + contrato).
-    # Si las 3 vars imprescindibles no están presentes, los enrichers
-    # se quedan en None y el pipeline las salta (best-effort).
+    # Sigrid — enriquecimiento obra + contrato.
+    # Solo se cablean si las 3 credenciales están presentes.
     # ----------------------------------------------------------- #
     obra_enrichment_service: ObraEnrichmentService | None = None
     contrato_enrichment_service: ContratoEnrichmentService | None = None
 
-    if settings.sigrid_configured:
-        logger.info(
-            "[svc3-wiring] Sigrid configurado base_url=%s database=%s "
-            "→ creando clientes Sigrid + enrichers",
-            settings.sigrid_api_base_url,
-            settings.sigrid_api_database,
-        )
-
+    if settings.sigrid_credentials_present:
         sigrid_obra_client = SigridApiObraClient(
             base_url=settings.sigrid_api_base_url,
             function_key=settings.sigrid_api_function_key,
@@ -118,8 +119,6 @@ def build_app(settings: Settings) -> FastAPI:
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
-            database_rep=settings.sigrid_api_database_rep,
-            pdf_timeout_s=settings.sigrid_api_pdf_timeout_s,
         )
 
         obra_enrichment_service = ObraEnrichmentService(
@@ -127,59 +126,69 @@ def build_app(settings: Settings) -> FastAPI:
             repository=repository,
             enabled=settings.obra_enrichment_enabled,
         )
+
         contrato_enrichment_service = ContratoEnrichmentService(
             client=sigrid_contrato_client,
             repository=repository,
             cache=contrato_cache,
-            pdf_storage=document_storage,
+            pdf_storage=document_storage,  # mismo storage cubre PDFs de contrato
             enabled=True,
+        )
+
+        logger.info(
+            "[svc3][wiring] Sigrid CABLEADO base_url=%s db=%s "
+            "obra_enabled=%s",
+            settings.sigrid_api_base_url,
+            settings.sigrid_api_database,
+            settings.obra_enrichment_enabled,
         )
     else:
         logger.warning(
-            "[svc3-wiring] Sigrid NO configurado (faltan SIGRID_API_BASE_URL/"
-            "FUNCTION_KEY/DATABASE). Los enrichers de obra y contrato "
-            "quedan DESACTIVADOS — los albaranes se persistirán sin "
-            "buscar contratos en el ERP."
+            "[svc3][wiring] Sigrid NO cableado: faltan SIGRID_API_BASE_URL "
+            "/ SIGRID_API_FUNCTION_KEY / SIGRID_API_DATABASE en .env. "
+            "El enriquecimiento de obra y contrato quedará desactivado."
         )
 
     # ----------------------------------------------------------- #
-    # Valuation trigger (sv3 → sv6).
-    # Por defecto DESACTIVADO porque sv7 orquesta. Solo se cablea si
-    # VALUATION_TRIGGER_ENABLED=true y hay base_url, como mecanismo
-    # de rollback o despliegue sin orquestador.
+    # Trigger de valoración (sv6).
+    #
+    # IMPORTANTE: si el orquestador (sv7) está en uso, este trigger
+    # DEBE estar deshabilitado (VALUATION_TRIGGER_ENABLED=false en
+    # .env). El sv7 es quien llama al sv6. Si dejas este trigger
+    # activo, ambos llamarán a sv6 y se duplica el trabajo.
     # ----------------------------------------------------------- #
     valuation_trigger: HttpValuationTrigger | None = None
-    if settings.valuation_trigger_configured:
-        logger.warning(
-            "[svc3-wiring] VALUATION_TRIGGER_ENABLED=true → sv3 disparará "
-            "sv6 directamente. CUIDADO: si sv7 también está activo y "
-            "orquestando, podrías tener doble valoración. Recomendado: "
-            "VALUATION_TRIGGER_ENABLED=false cuando sv7 esté desplegado."
-        )
+    if (
+        settings.valuation_trigger_enabled
+        and (settings.valuation_api_base_url or "").strip()
+    ):
         valuation_trigger = HttpValuationTrigger(
             base_url=settings.valuation_api_base_url,
             async_timeout_s=settings.valuation_trigger_timeout_s,
             sync_timeout_s=settings.valuation_trigger_sync_timeout_s,
         )
+        logger.info(
+            "[svc3][wiring] Valuation trigger CABLEADO base_url=%s",
+            settings.valuation_api_base_url,
+        )
     else:
         logger.info(
-            "[svc3-wiring] valuation_trigger DESACTIVADO "
-            "(sv7 es quien orquesta la valoración tras el persist)"
+            "[svc3][wiring] Valuation trigger NO cableado "
+            "(VALUATION_TRIGGER_ENABLED=%s, base_url=%s). "
+            "Esperado si el orquestador sv7 está en uso.",
+            settings.valuation_trigger_enabled,
+            settings.valuation_api_base_url,
         )
 
     # ----------------------------------------------------------- #
-    # Pipelines.
+    # Pipeline final con todos los colaboradores.
     # ----------------------------------------------------------- #
-    persist_pipeline = PersistAlbaranPipeline(
+    pipeline = PersistAlbaranPipeline(
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
         obra_enrichment_service=obra_enrichment_service,
         contrato_enrichment_service=contrato_enrichment_service,
-        valuation_trigger=valuation_trigger,
-    )
-    select_contrato_pipeline = SelectContratoPipeline(
-        repository=repository,
         valuation_trigger=valuation_trigger,
     )
 
@@ -204,15 +213,14 @@ def build_app(settings: Settings) -> FastAPI:
             "sharepoint_folder_root": settings.sharepoint_folder_root,
             "sharepoint_folder_url": settings.sharepoint_folder_url,
             "sharepoint_site_path": settings.sharepoint_site_path,
-            "sigrid_configured": settings.sigrid_configured,
+            "phase_2_persistence_wired": True,
+            "sigrid_wired": settings.sigrid_credentials_present,
             "obra_enrichment_enabled": (
                 obra_enrichment_service is not None
                 and settings.obra_enrichment_enabled
             ),
-            "contrato_enrichment_enabled": (
-                contrato_enrichment_service is not None
-            ),
-            "valuation_trigger_enabled": settings.valuation_trigger_configured,
+            "contrato_enrichment_enabled": contrato_enrichment_service is not None,
+            "valuation_trigger_enabled": valuation_trigger is not None,
         }
 
     @app.post("/v1/albaranes/persist")
@@ -242,7 +250,7 @@ def build_app(settings: Settings) -> FastAPI:
             ) from exc
 
         try:
-            result = persist_pipeline.run(
+            result = pipeline.run(
                 PersistAlbaranRequest(
                     filename=file.filename or "document.bin",
                     mime_type=file.content_type or "application/octet-stream",
@@ -251,52 +259,28 @@ def build_app(settings: Settings) -> FastAPI:
                     context=context if isinstance(context, dict) else {},
                 )
             )
+
+            # Fase 2 (revisión IA): UPDATE post-save best-effort.
+            # No rompe el persist principal si falla.
+            try:
+                phase2_service.persist_metadata(
+                    document_id=result.document_id,
+                    raw_envelope=extraction_envelope,
+                )
+            except Exception:
+                logger.exception(
+                    "[svc3] error persistiendo metadata fase 2 "
+                    "doc=%s; el persist principal SÍ se aplicó",
+                    result.document_id,
+                )
+
             return asdict(result)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            logger.exception("Error persistiendo albarán")
             raise HTTPException(
                 status_code=500,
                 detail=f"Error persistiendo albarán: {exc}",
-            ) from exc
-
-    @app.patch("/v1/albaranes/{document_id}/selected-contrato")
-    def patch_selected_contrato(
-        document_id: str,
-        payload: SelectedContratoPatch,
-    ) -> Dict[str, Any]:
-        """Cambia el contrato seleccionado del documento.
-
-        NOTA: con sv7 desplegado, sv4 emite eventos directos al
-        orquestador en lugar de llamar a este endpoint. El endpoint
-        se mantiene por compatibilidad y para casos de pruebas
-        manuales / scripts. El flag ``trigger_valuation`` solo tiene
-        efecto si el HttpValuationTrigger está cableado (es decir,
-        VALUATION_TRIGGER_ENABLED=true).
-        """
-        try:
-            result = select_contrato_pipeline.run(
-                SelectContratoRequest(
-                    document_id=document_id,
-                    codigo_contrato=payload.codigo_contrato,
-                    trigger_valuation=payload.trigger_valuation,
-                    wait_for_valuation=payload.wait_for_valuation,
-                )
-            )
-            return asdict(result)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception(
-                "Error en select-contrato document_id=%s",
-                document_id,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error: {exc}",
             ) from exc
 
     return app
