@@ -186,6 +186,7 @@ cython_debug/
 *.png
 *.xlsx
 *.json
+*.zip
 
 output/
 input/

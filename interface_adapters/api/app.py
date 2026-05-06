@@ -16,13 +16,25 @@ solo si las credenciales / variables están presentes en .env. Si
 faltan, el pipeline arranca igual y los pasos correspondientes se
 loguean como SKIP. Así el sv3 nunca se rompe por una credencial
 ausente.
+
+Endpoint /schema/ddl
+--------------------
+A partir del refactor "schema contributors", el sv3 expone el DDL
+de SUS tablas (las del schema ``albaran_persist``) por HTTP. El
+orquestador (sv7) lo descubre, lo descarga y lo aplica contra la
+BBDD compartida en orden topológico junto con el DDL del sv6.
+
+Esto NO sustituye al ``repository.initialize()`` interno: el sv3
+sigue creando sus tablas al arrancar como hoy. El endpoint solo
+EXPONE el DDL para que un orquestador externo pueda aplicarlo en
+otro contexto (BBDD nueva, despliegue limpio).
 """
 from __future__ import annotations
 
 import json
 import logging
 from dataclasses import asdict
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
@@ -41,6 +53,7 @@ from application.services.phase2_persistence_service import (
 from config.settings import Settings
 from infrastructure.clients.http_valuation_trigger import HttpValuationTrigger
 from infrastructure.database.phase2_ddl import apply_phase2_ddl
+from infrastructure.database import schema_contribution
 from infrastructure.database.session_factory import SessionFactory
 from infrastructure.database.sqlalchemy_albaran_repository import (
     SqlAlchemyAlbaranRepository,
@@ -221,6 +234,35 @@ def build_app(settings: Settings) -> FastAPI:
             ),
             "contrato_enrichment_enabled": contrato_enrichment_service is not None,
             "valuation_trigger_enabled": valuation_trigger is not None,
+        }
+
+    # ----------------------------------------------------------- #
+    # Endpoint público de schema (consumido por el orquestador sv7).
+    # ----------------------------------------------------------- #
+    @app.get("/schema/ddl")
+    def get_schema_ddl() -> Dict[str, Any]:
+        """Devuelve el DDL de las tablas propias de este servicio.
+
+        Consumido por el orquestador (sv7) para crear / migrar el
+        schema en la BBDD compartida sin tener una copia local
+        desactualizada del DDL.
+
+        Cualquier servicio de orquestación que quiera aplicar este
+        DDL DEBE hacerlo en autocommit (cada sentencia en su propia
+        transacción) para que un fallo puntual no aborte el resto.
+        """
+        ddl = schema_contribution.get_ddl_statements()
+        return {
+            "schema_name": schema_contribution.SCHEMA_NAME,
+            "schema_version": schema_contribution.SCHEMA_VERSION,
+            "depends_on": list(schema_contribution.SCHEMA_DEPENDS_ON),
+            "owned_tables": schema_contribution.get_owned_table_names(),
+            "external_table_dependencies":
+                schema_contribution.get_external_table_dependencies(),
+            "ddl_statements": [
+                {"label": label, "sql": sql} for label, sql in ddl
+            ],
+            "total_statements": len(ddl),
         }
 
     @app.post("/v1/albaranes/persist")
