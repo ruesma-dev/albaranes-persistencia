@@ -51,8 +51,10 @@ class ContratoEnrichmentService:
          los que no hayan cambiado de versión).
       5. Para cada contrato: si el ``gra_rep_ide`` coincide con el
          previamente guardado, inyecta los paths en el DTO para que
-         ``replace_contratos`` los persista directamente.
-      6. ``replace_contratos`` (borra + inserta todo).
+        ``upsert_contratos`` los persista directamente.
+      6. ``upsert_contratos`` (UPSERT por ``sigrid_ide`` — un mismo
+         contrato del ERP se actualiza en lugar de duplicar entre
+         albaranes).
       7. Para los contratos donde el ``gra_rep_ide`` cambió o es nuevo,
          descarga el PDF de Sigrid y lo sube a SharePoint. Tras cada
          upload, actualiza los paths en BBDD vía
@@ -241,7 +243,7 @@ class ContratoEnrichmentService:
 
         # Paso 6: replace atómico (con paths ya rellenos para reutilizados).
         try:
-            self._repository.replace_contratos(
+            self._repository.upsert_contratos(
                 document_id=merge_document_id,
                 contratos=contratos_with_maybe_reused,
             )
@@ -374,7 +376,7 @@ class ContratoEnrichmentService:
             return None
 
         # Hit: copiamos el contrato cacheado al merge usando
-        # replace_contratos. Reusamos los paths del PDF si los tenía
+        # upsert_contratos. Reusamos los paths del PDF si los tenía
         # cacheados (en cuyo caso ahorramos la subida a SharePoint).
         logger.info(
             "%s CACHE HIT obra=%s cif=%s fecha=%s -> codigo=%s "
@@ -393,7 +395,7 @@ class ContratoEnrichmentService:
         )
 
         try:
-            self._repository.replace_contratos(
+            self._repository.upsert_contratos(
                 document_id=merge_document_id,
                 contratos=[cached],
             )

@@ -20,6 +20,25 @@ _LOG_PREFIX = "[contrato-enrichment][sigrid-client]"
 
 
 # Query cabecera + líneas (ctr.totbas, partida via obrparpar, emp=1).
+#
+# IMPORTANTE: la SELECT incluye DOS identificadores únicos del ERP:
+#
+#   * ``ctr.ide AS contrato_ide`` — INDICE PRIMARIO de la cabecera del
+#     contrato en Sigrid. Inmutable. Se persiste en
+#     ``albaran_contratos_merge.sigrid_ide`` y se usa como clave de
+#     UPSERT (un mismo contrato en BBDD se actualiza en lugar de
+#     duplicarse cuando llegan más albaranes que lo referencien).
+#
+#   * ``ctrpro.ide AS line_ide`` — INDICE PRIMARIO de la línea de
+#     contrato en Sigrid. Inmutable. Se persiste en
+#     ``albaran_contrato_lines_merge.sigrid_ide`` y se usa como clave
+#     de UPSERT por línea.
+#
+# Antes el sv3 hacía DELETE+INSERT por document_id en cada albarán, lo
+# que duplicaba contratos cuando el mismo contrato salía en varios
+# albaranes. Ahora con estas dos columnas hacemos UPSERT por la
+# identidad real del ERP, y la BBDD es la "vista actualizada" del
+# estado en Sigrid (no una colección de copias por albarán).
 _SQL_HEADER_AND_LINES = """\
 SELECT
     ctr.ide             AS contrato_ide,
@@ -34,6 +53,7 @@ SELECT
     ctr.entres          AS nombre_proveedor,
     con_obr.cod         AS codigo_obra,
     con_obr.res         AS nombre_obra,
+    ctrpro.ide          AS line_ide,
     ctrpro.pos          AS linea,
     ctrpro.numlin       AS numero_linea,
     con_pro.cod         AS codigo_producto,
@@ -183,6 +203,7 @@ class SigridApiContratoClient:
                     gra_rep_ide=gra_rep_ide,
                     pdf_sharepoint_relative_path=None,
                     pdf_sharepoint_web_url=None,
+                    sigrid_ide=contrato.sigrid_ide,
                     lines=contrato.lines,
                 )
             )
@@ -397,6 +418,7 @@ class SigridApiContratoClient:
                     doc_origen=_opt_str(row_map.get("doc_origen")),
                     codigo_partida=_opt_str(row_map.get("codigo_partida")),
                     descripcion_partida=_opt_str(row_map.get("descripcion_partida")),
+                    sigrid_ide=_opt_int(row_map.get("line_ide")),
                 )
             )
 
@@ -421,6 +443,7 @@ class SigridApiContratoClient:
                     gra_rep_ide=None,
                     pdf_sharepoint_relative_path=None,
                     pdf_sharepoint_web_url=None,
+                    sigrid_ide=contrato_ide,
                     lines=lines,
                 )
             )

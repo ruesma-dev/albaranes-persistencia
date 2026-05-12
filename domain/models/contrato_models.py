@@ -13,6 +13,14 @@ class ContratoLineFromSigrid:
 
     Los valores numéricos vienen como DECIMAL de SQL Server; el adaptador
     Sigrid los convierte a ``float`` en Python.
+
+    ``sigrid_ide`` es el ``ctrpro.ide`` (entero, INDICE PRIMARIO en Sigrid).
+    Identifica de forma estable y única la línea del contrato en el ERP.
+    Es la clave por la que ``upsert_contratos`` deduplica al persistir:
+    si llega un albarán nuevo cuya respuesta de Sigrid contiene la misma
+    ``sigrid_ide``, en lugar de insertar una fila nueva, se actualiza la
+    existente. Puede ser ``None`` solo si la consulta a Sigrid no la
+    devolvió (no debería ocurrir con la SELECT actual).
     """
 
     codigo_contrato: str
@@ -34,6 +42,7 @@ class ContratoLineFromSigrid:
     doc_origen: str | None
     codigo_partida: str | None
     descripcion_partida: str | None
+    sigrid_ide: int | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,12 @@ class ContratoEnrichmentResult:
       - En la primera ejecución van ``None`` (se rellenan después).
       - Cuando se reutiliza un PDF ya subido (mismo gra_rep_ide) se
         pueden inyectar directamente sin descarga.
+
+    ``sigrid_ide`` es el ``ctr.ide`` (entero, INDICE PRIMARIO en Sigrid).
+    Identifica de forma estable y única la cabecera del contrato en el
+    ERP. Es la clave por la que ``upsert_contratos`` deduplica al
+    persistir cabeceras. Puede ser ``None`` solo si la consulta a Sigrid
+    no la devolvió (no debería ocurrir con la SELECT actual).
     """
 
     codigo_contrato: str
@@ -68,4 +83,5 @@ class ContratoEnrichmentResult:
     gra_rep_ide: int | None
     pdf_sharepoint_relative_path: str | None = None
     pdf_sharepoint_web_url: str | None = None
+    sigrid_ide: int | None = None
     lines: list[ContratoLineFromSigrid] = field(default_factory=list)

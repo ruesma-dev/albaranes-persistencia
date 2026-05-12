@@ -145,6 +145,7 @@ class SqlAlchemyContratoCacheRepository:
                 doc_origen=line.doc_origen,
                 codigo_partida=line.codigo_partida,
                 descripcion_partida=line.descripcion_partida,
+                sigrid_ide=line.sigrid_ide,
             )
             for line in cabecera.lines
         ]
@@ -164,6 +165,7 @@ class SqlAlchemyContratoCacheRepository:
             gra_rep_ide=cabecera.gra_rep_ide,
             pdf_sharepoint_relative_path=cabecera.pdf_sharepoint_relative_path,
             pdf_sharepoint_web_url=cabecera.pdf_sharepoint_web_url,
+            sigrid_ide=cabecera.sigrid_ide,
             lines=lines,
         )
 
@@ -250,6 +252,7 @@ class SqlAlchemyContratoCacheRepository:
             "cif_proveedor": contrato.cif_proveedor,
             "codigo_contrato": contrato.codigo_contrato,
             "fecha_alta_contrato": contrato.fecha_alta_contrato,
+            "sigrid_ide": contrato.sigrid_ide,
             "nombre_contrato": contrato.nombre_contrato,
             "fecha_contrato": contrato.fecha_contrato,
             "vigencia_desde": contrato.vigencia_desde,
@@ -269,6 +272,7 @@ class SqlAlchemyContratoCacheRepository:
         update_columns = {
             col: getattr(stmt.excluded, col)
             for col in (
+                "sigrid_ide",
                 "nombre_contrato",
                 "fecha_contrato",
                 "vigencia_desde",
@@ -321,6 +325,7 @@ class SqlAlchemyContratoCacheRepository:
             session.add(
                 ContratoCacheLineOrm(
                     contrato_cache_id=cabecera_id,
+                    sigrid_ide=line.sigrid_ide,
                     codigo_contrato=codigo_contrato,
                     linea=line.linea,
                     numero_linea=line.numero_linea,

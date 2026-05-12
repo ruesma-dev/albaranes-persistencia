@@ -47,6 +47,14 @@ class ContratoCacheOrm(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
 
+    # Identificador único del contrato en Sigrid (``ctr.ide``).
+    # Permite a la caché ser explícita sobre QUÉ contrato del ERP está
+    # representando, y se propaga al merge cuando hay cache HIT para
+    # que el UPSERT de albaran_contratos_merge pueda deduplicar
+    # también. UNIQUE parcial gestionado en schema_contribution.py
+    # (no aquí con unique=True) para permitir múltiples NULLs legacy.
+    sigrid_ide = Column(Integer, nullable=True, index=True)
+
     codigo_obra = Column(String(32), nullable=False)
     cif_proveedor = Column(String(32), nullable=False)
     codigo_contrato = Column(String(64), nullable=False)
@@ -109,6 +117,10 @@ class ContratoCacheLineOrm(Base):
         nullable=False,
         index=True,
     )
+
+    # Identificador único de la línea en Sigrid (``ctrpro.ide``). Mismo
+    # papel que en la cabecera. UNIQUE parcial via schema_contribution.
+    sigrid_ide = Column(Integer, nullable=True, index=True)
 
     codigo_contrato = Column(String(64), nullable=False)
     linea = Column(Integer, nullable=True)

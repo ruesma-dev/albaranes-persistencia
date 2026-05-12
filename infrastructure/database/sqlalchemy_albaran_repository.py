@@ -738,13 +738,43 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             ).first()
             return row is not None
 
-    def replace_contratos(
+    def upsert_contratos(
         self,
         *,
         document_id: str,
         contratos: list[ContratoEnrichmentResult],
     ) -> None:
-        """Reemplaza cabeceras + líneas de contrato atómicamente."""
+        """UPSERT de cabeceras + líneas de contrato por ``sigrid_ide``.
+
+        Antes este método se llamaba ``replace_contratos`` y hacía
+        DELETE+INSERT por ``document_id``. El problema: si dos albaranes
+        traían el mismo contrato del ERP, en BBDD aparecían dos filas
+        distintas con el mismo ``codigo_contrato`` (una por cada
+        ``document_id``). Eso impedía la conciliación correcta entre
+        valoraciones y contrato.
+
+        Ahora cada cabecera y cada línea tiene un ``sigrid_ide`` (=
+        ``ctr.ide`` y ``ctrpro.ide`` en el ERP, ambos INDICE PRIMARIO
+        únicos y estables). Hacemos ``INSERT ... ON CONFLICT
+        (sigrid_ide) DO UPDATE``: cuando el contrato ya existe se
+        actualiza con los datos más frescos; cuando no, se inserta.
+
+        Comportamiento clave:
+          * ``document_id`` se sobrescribe en UPDATE con el del albarán
+            actual (opción B confirmada por el usuario): siempre el
+            albarán más reciente que ha tocado este contrato.
+          * Las líneas existentes que NO aparecen ya en la respuesta
+            de Sigrid de hoy NO se borran. Si Sigrid quitara una línea
+            (no debería pasar), preferimos conservarla histórica que
+            eliminarla en silencio.
+          * Filas SIN ``sigrid_ide`` (registros legacy o respuestas
+            de Sigrid mal formadas) caen al modo INSERT clásico — se
+            crean filas nuevas. Estas filas perderán el beneficio del
+            UPSERT pero el sistema sigue funcionando.
+
+        El método antiguo ``replace_contratos`` se mantiene como alias
+        deprecado por compatibilidad con código que aún lo llamara.
+        """
         self.initialize()
         now = datetime.now(timezone.utc).isoformat()
         with self._session_factory.create_session() as session:
@@ -752,79 +782,320 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             if merge_doc is None:
                 raise KeyError(f"Documento merge no encontrado: {document_id}")
 
-            deleted = session.execute(
-                delete(AlbaranContratoMergeOrm).where(
-                    AlbaranContratoMergeOrm.document_id == document_id
-                )
-            )
-            session.flush()
+            cabeceras_upserted = 0
+            cabeceras_inserted_legacy = 0
+            total_lines_upserted = 0
+            total_lines_inserted_legacy = 0
 
-            total_lines_inserted = 0
             for contrato in contratos:
-                header_orm = AlbaranContratoMergeOrm(
+                cabecera_id, was_upsert = self._upsert_contrato_cabecera(
+                    session=session,
+                    contrato=contrato,
                     document_id=document_id,
-                    codigo_contrato=contrato.codigo_contrato,
-                    nombre_contrato=contrato.nombre_contrato,
-                    fecha_alta_contrato=contrato.fecha_alta_contrato,
-                    fecha_contrato=contrato.fecha_contrato,
-                    vigencia_desde=contrato.vigencia_desde,
-                    vigencia_hasta=contrato.vigencia_hasta,
-                    importe_total=contrato.importe_total,
-                    cif_proveedor=contrato.cif_proveedor,
-                    nombre_proveedor=contrato.nombre_proveedor,
-                    codigo_obra=contrato.codigo_obra,
-                    nombre_obra=contrato.nombre_obra,
-                    gra_rep_ide=contrato.gra_rep_ide,
-                    pdf_sharepoint_relative_path=contrato.pdf_sharepoint_relative_path,
-                    pdf_sharepoint_web_url=contrato.pdf_sharepoint_web_url,
-                    fetched_at_utc=now,
+                    now=now,
                 )
-                session.add(header_orm)
-                session.flush()
+                if cabecera_id is None:
+                    logger.warning(
+                        "[contrato-enrichment][repo] upsert_contratos: "
+                        "no se pudo upsertar cabecera codigo=%s; "
+                        "saltamos sus líneas.",
+                        contrato.codigo_contrato,
+                    )
+                    continue
+                if was_upsert:
+                    cabeceras_upserted += 1
+                else:
+                    cabeceras_inserted_legacy += 1
 
                 for line in (contrato.lines or []):
-                    session.add(
-                        AlbaranContratoLineMergeOrm(
-                            contrato_id=header_orm.id,
-                            codigo_contrato=contrato.codigo_contrato,
-                            linea=line.linea,
-                            numero_linea=line.numero_linea,
-                            codigo_producto=line.codigo_producto,
-                            codigo_alternativo=line.codigo_alternativo,
-                            unidad_medida=line.unidad_medida,
-                            descripcion_linea=line.descripcion_linea,
-                            uds=line.uds,
-                            cantidad_servida=line.cantidad_servida,
-                            cantidad_facturada=line.cantidad_facturada,
-                            pendiente_servir=line.pendiente_servir,
-                            precio_unitario=line.precio_unitario,
-                            precio_bruto=line.precio_bruto,
-                            descuentos=line.descuentos,
-                            importe_linea=line.importe_linea,
-                            cuota_iva=line.cuota_iva,
-                            doc_origen=line.doc_origen,
-                            codigo_partida=line.codigo_partida,
-                            descripcion_partida=line.descripcion_partida,
-                            fetched_at_utc=now,
-                        )
+                    line_was_upsert = self._upsert_contrato_linea(
+                        session=session,
+                        line=line,
+                        contrato_id=cabecera_id,
+                        codigo_contrato=contrato.codigo_contrato,
+                        now=now,
                     )
-                    total_lines_inserted += 1
+                    if line_was_upsert:
+                        total_lines_upserted += 1
+                    else:
+                        total_lines_inserted_legacy += 1
 
             session.commit()
             logger.info(
-                "[contrato-enrichment][repo] replace_contratos: "
-                "document_id=%s borrados=%s contratos=%s lineas=%s "
+                "[contrato-enrichment][repo] upsert_contratos: "
+                "document_id=%s contratos=%s "
+                "cabeceras_upsert=%s cabeceras_legacy_insert=%s "
+                "lineas_upsert=%s lineas_legacy_insert=%s "
                 "pdfs_con_path_inicial=%s",
                 document_id,
-                deleted.rowcount if hasattr(deleted, "rowcount") else "?",
                 len(contratos),
-                total_lines_inserted,
+                cabeceras_upserted,
+                cabeceras_inserted_legacy,
+                total_lines_upserted,
+                total_lines_inserted_legacy,
                 sum(
                     1
                     for c in contratos
                     if c.pdf_sharepoint_relative_path is not None
                 ),
             )
+
+    def replace_contratos(
+        self,
+        *,
+        document_id: str,
+        contratos: list[ContratoEnrichmentResult],
+    ) -> None:
+        """Alias DEPRECADO de :meth:`upsert_contratos`.
+
+        Se mantiene solo por compatibilidad con código antiguo (o tests
+        que aún lo invocan). En cuanto todo el código llame a
+        ``upsert_contratos``, este alias se podrá borrar.
+
+        OJO: el comportamiento ya NO es DELETE+INSERT. Si por algún
+        motivo necesitas el comportamiento antiguo de "limpiar todo lo
+        del document_id y re-insertar", hablemos antes — probablemente
+        es síntoma de otro problema.
+        """
+        logger.warning(
+            "[contrato-enrichment][repo] replace_contratos() está DEPRECADO; "
+            "usa upsert_contratos(). Se delega automáticamente."
+        )
+        return self.upsert_contratos(
+            document_id=document_id,
+            contratos=contratos,
+        )
+
+    @staticmethod
+    def _upsert_contrato_cabecera(
+        *,
+        session: Any,
+        contrato: ContratoEnrichmentResult,
+        document_id: str,
+        now: str,
+    ) -> tuple[int | None, bool]:
+        """Inserta o actualiza una cabecera de contrato.
+
+        Returns
+        -------
+        tuple[int | None, bool]
+            Par ``(cabecera_id, was_upsert)``. ``was_upsert`` es True
+            si se hizo UPSERT por sigrid_ide; False si la fila no tenía
+            sigrid_ide y se hizo INSERT clásico (modo legacy).
+            ``cabecera_id`` es ``None`` solo si ambos caminos fallan.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        # Camino legacy: sin sigrid_ide no podemos UPSERTear → INSERT.
+        if contrato.sigrid_ide is None:
+            header_orm = AlbaranContratoMergeOrm(
+                document_id=document_id,
+                sigrid_ide=None,
+                codigo_contrato=contrato.codigo_contrato,
+                nombre_contrato=contrato.nombre_contrato,
+                fecha_alta_contrato=contrato.fecha_alta_contrato,
+                fecha_contrato=contrato.fecha_contrato,
+                vigencia_desde=contrato.vigencia_desde,
+                vigencia_hasta=contrato.vigencia_hasta,
+                importe_total=contrato.importe_total,
+                cif_proveedor=contrato.cif_proveedor,
+                nombre_proveedor=contrato.nombre_proveedor,
+                codigo_obra=contrato.codigo_obra,
+                nombre_obra=contrato.nombre_obra,
+                gra_rep_ide=contrato.gra_rep_ide,
+                pdf_sharepoint_relative_path=contrato.pdf_sharepoint_relative_path,
+                pdf_sharepoint_web_url=contrato.pdf_sharepoint_web_url,
+                fetched_at_utc=now,
+            )
+            session.add(header_orm)
+            session.flush()
+            return int(header_orm.id), False
+
+        # Camino normal: UPSERT por sigrid_ide.
+        values = {
+            "document_id": document_id,
+            "sigrid_ide": contrato.sigrid_ide,
+            "codigo_contrato": contrato.codigo_contrato,
+            "nombre_contrato": contrato.nombre_contrato,
+            "fecha_alta_contrato": contrato.fecha_alta_contrato,
+            "fecha_contrato": contrato.fecha_contrato,
+            "vigencia_desde": contrato.vigencia_desde,
+            "vigencia_hasta": contrato.vigencia_hasta,
+            "importe_total": contrato.importe_total,
+            "cif_proveedor": contrato.cif_proveedor,
+            "nombre_proveedor": contrato.nombre_proveedor,
+            "codigo_obra": contrato.codigo_obra,
+            "nombre_obra": contrato.nombre_obra,
+            "gra_rep_ide": contrato.gra_rep_ide,
+            "pdf_sharepoint_relative_path":
+                contrato.pdf_sharepoint_relative_path,
+            "pdf_sharepoint_web_url": contrato.pdf_sharepoint_web_url,
+            "fetched_at_utc": now,
+        }
+        stmt = pg_insert(AlbaranContratoMergeOrm).values(**values)
+        # Columnas a refrescar en conflicto: TODAS menos la clave
+        # (sigrid_ide). En particular, document_id se sobrescribe
+        # con el del albarán actual (opción B).
+        update_columns = {
+            col: getattr(stmt.excluded, col)
+            for col in (
+                "document_id",
+                "codigo_contrato",
+                "nombre_contrato",
+                "fecha_alta_contrato",
+                "fecha_contrato",
+                "vigencia_desde",
+                "vigencia_hasta",
+                "importe_total",
+                "cif_proveedor",
+                "nombre_proveedor",
+                "codigo_obra",
+                "nombre_obra",
+                "gra_rep_ide",
+                "pdf_sharepoint_relative_path",
+                "pdf_sharepoint_web_url",
+                "fetched_at_utc",
+            )
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["sigrid_ide"],
+            index_where=text("sigrid_ide IS NOT NULL"),
+            set_=update_columns,
+        ).returning(AlbaranContratoMergeOrm.id)
+        try:
+            cabecera_id = session.execute(stmt).scalar_one()
+        except Exception:
+            logger.exception(
+                "[contrato-enrichment][repo] FALLO upsert cabecera "
+                "sigrid_ide=%s codigo=%s",
+                contrato.sigrid_ide,
+                contrato.codigo_contrato,
+            )
+            return None, True
+        return int(cabecera_id), True
+
+    @staticmethod
+    def _upsert_contrato_linea(
+        *,
+        session: Any,
+        line,  # ContratoLineFromSigrid
+        contrato_id: int,
+        codigo_contrato: str,
+        now: str,
+    ) -> bool:
+        """Inserta o actualiza una línea de contrato.
+
+        Returns
+        -------
+        bool
+            True si se hizo UPSERT por sigrid_ide; False si la línea no
+            tenía sigrid_ide y se hizo INSERT clásico (legacy).
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        line_sigrid_ide = getattr(line, "sigrid_ide", None)
+
+        if line_sigrid_ide is None:
+            session.add(
+                AlbaranContratoLineMergeOrm(
+                    contrato_id=contrato_id,
+                    sigrid_ide=None,
+                    codigo_contrato=codigo_contrato,
+                    linea=line.linea,
+                    numero_linea=line.numero_linea,
+                    codigo_producto=line.codigo_producto,
+                    codigo_alternativo=line.codigo_alternativo,
+                    unidad_medida=line.unidad_medida,
+                    descripcion_linea=line.descripcion_linea,
+                    uds=line.uds,
+                    cantidad_servida=line.cantidad_servida,
+                    cantidad_facturada=line.cantidad_facturada,
+                    pendiente_servir=line.pendiente_servir,
+                    precio_unitario=line.precio_unitario,
+                    precio_bruto=line.precio_bruto,
+                    descuentos=line.descuentos,
+                    importe_linea=line.importe_linea,
+                    cuota_iva=line.cuota_iva,
+                    doc_origen=line.doc_origen,
+                    codigo_partida=line.codigo_partida,
+                    descripcion_partida=line.descripcion_partida,
+                    fetched_at_utc=now,
+                )
+            )
+            return False
+
+        values = {
+            "contrato_id": contrato_id,
+            "sigrid_ide": line_sigrid_ide,
+            "codigo_contrato": codigo_contrato,
+            "linea": line.linea,
+            "numero_linea": line.numero_linea,
+            "codigo_producto": line.codigo_producto,
+            "codigo_alternativo": line.codigo_alternativo,
+            "unidad_medida": line.unidad_medida,
+            "descripcion_linea": line.descripcion_linea,
+            "uds": line.uds,
+            "cantidad_servida": line.cantidad_servida,
+            "cantidad_facturada": line.cantidad_facturada,
+            "pendiente_servir": line.pendiente_servir,
+            "precio_unitario": line.precio_unitario,
+            "precio_bruto": line.precio_bruto,
+            "descuentos": line.descuentos,
+            "importe_linea": line.importe_linea,
+            "cuota_iva": line.cuota_iva,
+            "doc_origen": line.doc_origen,
+            "codigo_partida": line.codigo_partida,
+            "descripcion_partida": line.descripcion_partida,
+            "fetched_at_utc": now,
+        }
+        stmt = pg_insert(AlbaranContratoLineMergeOrm).values(**values)
+        update_columns = {
+            col: getattr(stmt.excluded, col)
+            for col in (
+                # Importante: contrato_id también se actualiza, porque
+                # si la cabecera del contrato se "movió" a otra fila
+                # (no debería, pero por completitud) la línea va con
+                # ella.
+                "contrato_id",
+                "codigo_contrato",
+                "linea",
+                "numero_linea",
+                "codigo_producto",
+                "codigo_alternativo",
+                "unidad_medida",
+                "descripcion_linea",
+                "uds",
+                "cantidad_servida",
+                "cantidad_facturada",
+                "pendiente_servir",
+                "precio_unitario",
+                "precio_bruto",
+                "descuentos",
+                "importe_linea",
+                "cuota_iva",
+                "doc_origen",
+                "codigo_partida",
+                "descripcion_partida",
+                "fetched_at_utc",
+            )
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["sigrid_ide"],
+            index_where=text("sigrid_ide IS NOT NULL"),
+            set_=update_columns,
+        )
+        try:
+            session.execute(stmt)
+        except Exception:
+            logger.exception(
+                "[contrato-enrichment][repo] FALLO upsert linea "
+                "sigrid_ide=%s contrato_id=%s codigo_contrato=%s",
+                line_sigrid_ide,
+                contrato_id,
+                codigo_contrato,
+            )
+            return False
+        return True
 
     def update_contrato_pdf_paths(
         self,

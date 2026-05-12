@@ -92,11 +92,20 @@ SCHEMA_NAME: str = "albaran_persist"
 """Nombre lógico único del schema (consumido por sv7 como clave de
 dependencia y como label en los logs)."""
 
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 """Versión informativa. Súbela al añadir / cambiar / eliminar tablas
 o columnas. NO se usa para migraciones (no hay histórico aquí), solo
-para diagnóstico ("aplicando albaran_persist v1") y detección de
-deploys desincronizados."""
+para diagnóstico ("aplicando albaran_persist v2") y detección de
+deploys desincronizados.
+
+Historial:
+  * v1 — schema inicial (refactor schema-contributors).
+  * v2 — añadir ``sigrid_ide`` UNIQUE a ``albaran_contratos_merge`` y
+    ``albaran_contrato_lines_merge``; relajar FK de
+    ``albaran_contratos_merge.document_id`` a ON DELETE SET NULL y
+    nullable. Permite UPSERT por identidad de Sigrid en lugar de
+    DELETE+INSERT por document_id.
+"""
 
 SCHEMA_DEPENDS_ON: List[str] = []
 """Sv3 es la base — no depende de ningún otro contributor."""
@@ -283,6 +292,133 @@ def _alter_columns_for_contrato_tables() -> List[Tuple[str, str]]:
     ]
 
 
+def _alter_columns_for_sigrid_ide_upsert() -> List[Tuple[str, str]]:
+    """v2 — Soporte de UPSERT por ``sigrid_ide`` (ctr.ide / ctrpro.ide).
+
+    Esta tanda hace tres cosas idempotentes:
+
+    1. Añade la columna ``sigrid_ide INTEGER`` a las CUATRO tablas
+       de contratos: las dos ``_merge`` (albaran_contratos_merge,
+       albaran_contrato_lines_merge) Y las dos de caché global
+       (contratos_cache, contrato_cache_lines). Es nullable para no
+       romper backfill (filas históricas sin ``sigrid_ide`` se quedan
+       en NULL hasta que se vuelvan a enriquecer desde Sigrid).
+
+    2. Crea índices y constraint UNIQUE PARCIAL sobre ``sigrid_ide``
+       en las cuatro tablas, para habilitar el ``ON CONFLICT
+       (sigrid_ide) DO UPDATE``. Parcial = ``WHERE sigrid_ide IS NOT
+       NULL`` para permitir múltiples NULLs históricos.
+
+    3. Relaja la FK ``albaran_contratos_merge.document_id`` de
+       ``ON DELETE CASCADE`` a ``ON DELETE SET NULL`` y la hace
+       nullable. Razón: con UPSERT, un mismo contrato puede haber sido
+       traído por múltiples albaranes; borrar uno de esos albaranes
+       NO debe arrastrar contratos que sigan siendo válidos para
+       otros. La columna se queda con el ``document_id`` del último
+       albarán que tocó el contrato (opción B confirmada por usuario).
+
+    Todas las sentencias son idempotentes (IF NOT EXISTS / IF EXISTS).
+    """
+    statements: List[Tuple[str, str]] = []
+
+    # 1) Columna sigrid_ide en cabecera y líneas (merge + cache).
+    statements.extend([
+        ("ALTER albaran_contratos_merge.sigrid_ide",
+         "ALTER TABLE albaran_contratos_merge "
+         "ADD COLUMN IF NOT EXISTS sigrid_ide INTEGER"),
+        ("ALTER albaran_contrato_lines_merge.sigrid_ide",
+         "ALTER TABLE albaran_contrato_lines_merge "
+         "ADD COLUMN IF NOT EXISTS sigrid_ide INTEGER"),
+        ("ALTER contratos_cache.sigrid_ide",
+         "ALTER TABLE contratos_cache "
+         "ADD COLUMN IF NOT EXISTS sigrid_ide INTEGER"),
+        ("ALTER contrato_cache_lines.sigrid_ide",
+         "ALTER TABLE contrato_cache_lines "
+         "ADD COLUMN IF NOT EXISTS sigrid_ide INTEGER"),
+    ])
+
+    # 2) Índice + UNIQUE sobre sigrid_ide (parcial, ignora NULLs).
+    #
+    # Usamos CREATE UNIQUE INDEX (no ADD CONSTRAINT UNIQUE) porque
+    # CREATE UNIQUE INDEX soporta IF NOT EXISTS de forma idempotente;
+    # ADD CONSTRAINT en PostgreSQL no soporta IF NOT EXISTS sin DO
+    # block. Funcionalmente es equivalente para ON CONFLICT.
+    statements.extend([
+        ("INDEX uq_albaran_contratos_merge_sigrid_ide",
+         "CREATE UNIQUE INDEX IF NOT EXISTS "
+         "uq_albaran_contratos_merge_sigrid_ide "
+         "ON albaran_contratos_merge (sigrid_ide) "
+         "WHERE sigrid_ide IS NOT NULL"),
+        ("INDEX uq_albaran_contrato_lines_merge_sigrid_ide",
+         "CREATE UNIQUE INDEX IF NOT EXISTS "
+         "uq_albaran_contrato_lines_merge_sigrid_ide "
+         "ON albaran_contrato_lines_merge (sigrid_ide) "
+         "WHERE sigrid_ide IS NOT NULL"),
+        ("INDEX uq_contratos_cache_sigrid_ide",
+         "CREATE UNIQUE INDEX IF NOT EXISTS "
+         "uq_contratos_cache_sigrid_ide "
+         "ON contratos_cache (sigrid_ide) "
+         "WHERE sigrid_ide IS NOT NULL"),
+        ("INDEX uq_contrato_cache_lines_sigrid_ide",
+         "CREATE UNIQUE INDEX IF NOT EXISTS "
+         "uq_contrato_cache_lines_sigrid_ide "
+         "ON contrato_cache_lines (sigrid_ide) "
+         "WHERE sigrid_ide IS NOT NULL"),
+    ])
+
+    # 3) Relajar la FK document_id a ON DELETE SET NULL + nullable.
+    #
+    # PostgreSQL no soporta "ALTER CONSTRAINT ... ON DELETE SET NULL"
+    # directamente: hay que DROP la antigua y ADD la nueva. Lo
+    # encapsulamos en un DO block que comprueba el estado actual y
+    # solo actúa si la constraint existe con el ON DELETE incorrecto.
+    #
+    # La constraint clásica creada por SQLAlchemy para esta FK suele
+    # llamarse "albaran_contratos_merge_document_id_fkey". También
+    # contemplamos nombres alternativos por si en algún entorno se
+    # creó con otro nombre.
+    statements.extend([
+        ("ALTER albaran_contratos_merge.document_id DROP NOT NULL",
+         "ALTER TABLE albaran_contratos_merge "
+         "ALTER COLUMN document_id DROP NOT NULL"),
+        ("DROP FK albaran_contratos_merge_document_id (legacy CASCADE)",
+         """
+         DO $$
+         BEGIN
+             IF EXISTS (
+                 SELECT 1 FROM information_schema.table_constraints
+                 WHERE table_name = 'albaran_contratos_merge'
+                   AND constraint_name = 'albaran_contratos_merge_document_id_fkey'
+                   AND constraint_type = 'FOREIGN KEY'
+             ) THEN
+                 ALTER TABLE albaran_contratos_merge
+                     DROP CONSTRAINT albaran_contratos_merge_document_id_fkey;
+             END IF;
+         END$$
+         """),
+        ("ADD FK albaran_contratos_merge_document_id (SET NULL)",
+         """
+         DO $$
+         BEGIN
+             IF NOT EXISTS (
+                 SELECT 1 FROM information_schema.table_constraints
+                 WHERE table_name = 'albaran_contratos_merge'
+                   AND constraint_name = 'albaran_contratos_merge_document_id_fkey'
+                   AND constraint_type = 'FOREIGN KEY'
+             ) THEN
+                 ALTER TABLE albaran_contratos_merge
+                     ADD CONSTRAINT albaran_contratos_merge_document_id_fkey
+                     FOREIGN KEY (document_id)
+                     REFERENCES albaran_documents_merge(id)
+                     ON DELETE SET NULL;
+             END IF;
+         END$$
+         """),
+    ])
+
+    return statements
+
+
 def _constraint_cleanups() -> List[Tuple[str, str]]:
     """DROP CONSTRAINT IF EXISTS y CREATE INDEX IF NOT EXISTS.
 
@@ -371,8 +507,9 @@ def get_ddl_statements() -> List[Tuple[str, str]]:
       1. CREATE TABLE / CREATE INDEX desde el ORM (sv3 base).
       2. ALTERs evolutivos sobre tablas de documentos / líneas.
       3. ALTERs sobre tablas de contratos / partidas.
-      4. Limpieza de constraints + índices.
-      5. Columnas de fase 2 (review_phase2_*, source_phase).
+      4. ALTERs v2: sigrid_ide + UPSERT (ON DELETE SET NULL).
+      5. Limpieza de constraints + índices.
+      6. Columnas de fase 2 (review_phase2_*, source_phase).
 
     Returns
     -------
@@ -384,6 +521,7 @@ def get_ddl_statements() -> List[Tuple[str, str]]:
     statements.extend(_alter_columns_for_document_tables())
     statements.extend(_alter_columns_for_line_tables())
     statements.extend(_alter_columns_for_contrato_tables())
+    statements.extend(_alter_columns_for_sigrid_ide_upsert())
     statements.extend(_constraint_cleanups())
     statements.extend(_phase2_alters())
     return statements
