@@ -7,21 +7,21 @@ from domain.models.contrato_models import ContratoEnrichmentResult
 
 
 class ContratoMergeRepository(Protocol):
-    """Puerto mínimo que necesita ``ContratoEnrichmentService``.
+    """Puerto mínimo que necesitan los servicios de
+    enrichment/refetch de contratos.
 
     ``SqlAlchemyAlbaranRepository`` lo cumple por duck-typing al exponer
-    estos métodos. El enrichment es idempotente: cada ejecución borra
-    los contratos anteriores del documento y vuelve a insertarlos.
+    estos métodos. Cubre dos casos de uso:
 
-    Para soporte de PDFs del contrato, incluye dos operaciones que el
-    orquestador usa para hacer reutilización de PDFs ya subidos:
+      A) Enrichment automático (pipeline): se ejecuta cuando llega un
+         albarán nuevo y lee CIF + obra del envelope.
+      B) Refetch manual (portal): se ejecuta cuando el revisor cambia
+         CIF u obra y pulsa "Volver a buscar".
 
-      1. ``get_existing_pdf_paths`` — ANTES del replace, para saber qué
-         PDFs ya teníamos y evitar descarga+subida si ``gra_rep_ide`` no
-         cambió.
-      2. ``update_contrato_pdf_paths`` — DESPUÉS del replace + subida,
-         para persistir ``pdf_sharepoint_relative_path`` y
-         ``pdf_sharepoint_web_url`` en la cabecera del contrato.
+    Ambos casos comparten primitiva: ``upsert_contratos`` (UPSERT por
+    ``sigrid_ide``, idempotente). La auto-selección post-refetch usa
+    ``set_selected_contrato`` y se consulta el resultado con
+    ``get_selected_contrato_codigo``.
     """
 
     def get_merge_cif_and_obra(
@@ -44,18 +44,36 @@ class ContratoMergeRepository(Protocol):
         """
         ...
 
+    def upsert_contratos(
+        self,
+        *,
+        document_id: str,
+        contratos: list[ContratoEnrichmentResult],
+    ) -> None:
+        """UPSERT de cabeceras + líneas por ``sigrid_ide``.
+
+        Cuando un contrato ya existe en BBDD con el mismo ``sigrid_ide``,
+        se actualiza con los datos frescos (incluido ``document_id``,
+        que pasa al del albarán más reciente). Cuando no existe, se
+        inserta. NUNCA se borra: si Sigrid quita una línea de un
+        contrato, en BBDD se conserva por seguridad.
+
+        Persiste ``gra_rep_ide`` pero NO los paths de SharePoint —
+        esos se actualizan después vía ``update_contrato_pdf_paths``.
+        """
+        ...
+
     def replace_contratos(
         self,
         *,
         document_id: str,
         contratos: list[ContratoEnrichmentResult],
     ) -> None:
-        """Borra los contratos existentes del doc e inserta los nuevos.
+        """Alias DEPRECADO de :meth:`upsert_contratos`.
 
-        Debe commitear dentro del método. Persiste también ``gra_rep_ide``
-        pero NO los paths de SharePoint — esos se actualizan después
-        vía ``update_contrato_pdf_paths`` para que la subida del PDF
-        (lenta y fallable) quede fuera de la transacción de replace.
+        Se mantiene en el port por compatibilidad con código antiguo
+        que aún lo invoque. La implementación debe delegar en
+        ``upsert_contratos`` (eso es lo que hace el repo concreto).
         """
         ...
 
@@ -77,4 +95,17 @@ class ContratoMergeRepository(Protocol):
         codigo_contrato: str | None,
     ) -> None:
         """Fija selected_contrato_codigo en el merge. None = deseleccionar."""
+        ...
+
+    def get_selected_contrato_codigo(
+        self,
+        *,
+        document_id: str,
+    ) -> str | None:
+        """Devuelve el código del contrato actualmente seleccionado.
+
+        ``None`` si no hay selección (ej. el albarán tiene 0 ó >1
+        contratos y aún no se ha elegido manualmente). Levanta ``KeyError``
+        si el documento no existe en ``albaran_documents_merge``.
+        """
         ...

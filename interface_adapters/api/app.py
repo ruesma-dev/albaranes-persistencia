@@ -46,6 +46,9 @@ from application.services.albaran_normalizer import AlbaranNormalizer
 from application.services.contrato_enrichment_service import (
     ContratoEnrichmentService,
 )
+from application.services.contrato_refetch_service import (
+    ContratoRefetchService,
+)
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from application.services.phase2_persistence_service import (
     Phase2PersistenceService,
@@ -119,6 +122,7 @@ def build_app(settings: Settings) -> FastAPI:
     # ----------------------------------------------------------- #
     obra_enrichment_service: ObraEnrichmentService | None = None
     contrato_enrichment_service: ContratoEnrichmentService | None = None
+    contrato_refetch_service: ContratoRefetchService | None = None
 
     if settings.sigrid_credentials_present:
         sigrid_obra_client = SigridApiObraClient(
@@ -146,6 +150,18 @@ def build_app(settings: Settings) -> FastAPI:
             cache=contrato_cache,
             pdf_storage=document_storage,  # mismo storage cubre PDFs de contrato
             enabled=True,
+        )
+
+        # ---------------------------------------------------------------- #
+        # ContratoRefetchService — wrapper fino sobre el enrichment para
+        # el caso de uso "el usuario pulsó 'Volver a buscar' en el
+        # portal". Reutiliza el enrichment con force_refetch=True y
+        # devuelve un outcome rico (status/message/...) para que el
+        # front pinte feedback.
+        # ---------------------------------------------------------------- #
+        contrato_refetch_service = ContratoRefetchService(
+            enrichment=contrato_enrichment_service,
+            repository=repository,
         )
 
         logger.info(
@@ -324,5 +340,51 @@ def build_app(settings: Settings) -> FastAPI:
                 status_code=500,
                 detail=f"Error persistiendo albarán: {exc}",
             ) from exc
+
+    # ---------------------------------------------------------------- #
+    # Re-fetch manual de contratos (lanzado por el sv4 cuando el
+    # revisor pulsa "Volver a buscar" en el portal).
+    #
+    # Comportamiento:
+    #   - 200 + outcome: el sv3 fue capaz de procesar la petición
+    #     (con o sin contratos encontrados). El outcome.status detalla.
+    #   - 404: documento no existe en el merge.
+    #   - 503: Sigrid no está cableado en este servicio (faltan
+    #     SIGRID_API_* en .env del sv3).
+    #
+    # Diseño: el endpoint NO ofrece ningún parámetro de entrada. El
+    # sv3 lee CIF + obra DEL MERGE actual. Si el revisor cambió esos
+    # campos en el portal, el sv4 debe guardarlos PRIMERO (su
+    # endpoint de save) y DESPUÉS llamar a este. Así mantenemos
+    # una sola fuente de verdad: la BBDD.
+    # ---------------------------------------------------------------- #
+    @app.post("/v1/albaranes/{document_id}/re-fetch-contratos")
+    def re_fetch_contratos(document_id: str) -> Dict[str, Any]:
+        if contrato_refetch_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "El servicio de búsqueda de contratos no está "
+                    "configurado en el sv3. Revisa SIGRID_API_BASE_URL"
+                    " / SIGRID_API_FUNCTION_KEY / SIGRID_API_DATABASE "
+                    "en el .env del sv3."
+                ),
+            )
+        try:
+            outcome = contrato_refetch_service.refetch(
+                document_id=document_id,
+            )
+        except KeyError as exc:
+            # Lanzado por el repo si el documento no existe.
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        logger.info(
+            "[svc3] re-fetch-contratos document_id=%s status=%s "
+            "count=%s selected=%s",
+            document_id,
+            outcome.status,
+            outcome.count,
+            outcome.selected_contrato_codigo,
+        )
+        return asdict(outcome)
 
     return app
