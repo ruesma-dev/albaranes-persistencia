@@ -1,6 +1,7 @@
 # application/services/contrato_enrichment_service.py
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 from application.services.obra_code_normalizer import normalize_obra_code
@@ -51,10 +52,8 @@ class ContratoEnrichmentService:
          los que no hayan cambiado de versión).
       5. Para cada contrato: si el ``gra_rep_ide`` coincide con el
          previamente guardado, inyecta los paths en el DTO para que
-        ``upsert_contratos`` los persista directamente.
-      6. ``upsert_contratos`` (UPSERT por ``sigrid_ide`` — un mismo
-         contrato del ERP se actualiza en lugar de duplicar entre
-         albaranes).
+         ``replace_contratos`` los persista directamente.
+      6. ``replace_contratos`` (borra + inserta todo).
       7. Para los contratos donde el ``gra_rep_ide`` cambió o es nuevo,
          descarga el PDF de Sigrid y lo sube a SharePoint. Tras cada
          upload, actualiza los paths en BBDD vía
@@ -243,7 +242,7 @@ class ContratoEnrichmentService:
 
         # Paso 6: replace atómico (con paths ya rellenos para reutilizados).
         try:
-            self._repository.upsert_contratos(
+            self._repository.replace_contratos(
                 document_id=merge_document_id,
                 contratos=contratos_with_maybe_reused,
             )
@@ -252,11 +251,34 @@ class ContratoEnrichmentService:
             return 0
 
         # Paso 7: descargar + subir PDFs pendientes, y actualizar paths.
+        #
+        # IMPORTANTE: _download_and_store_pdf devuelve los paths
+        # finales (relative_path, web_url) si la operación fue OK.
+        # Los usamos para RECONSTRUIR el DTO en la lista local
+        # (los DTOs son frozen=True, hay que crear uno nuevo). Sin
+        # esto, el paso C (caché) verá pdf_sharepoint_* = None y
+        # escribirá una caché que no sirve para reutilizar.
         if self._pdf_storage is not None:
             for idx in pending_pdf_indices:
-                self._download_and_store_pdf(
+                rel_path, web_url = self._download_and_store_pdf(
                     document_id=merge_document_id,
                     contrato=contratos_with_maybe_reused[idx],
+                )
+                if rel_path is None and web_url is None:
+                    # Fallo en algún paso (descarga, subida o UPDATE):
+                    # ya está logueado por el método; aquí no propagamos
+                    # nada al DTO y la caché mantendrá None para este
+                    # contrato (consistente con la realidad de BBDD).
+                    continue
+                old = contratos_with_maybe_reused[idx]
+                # Reconstruimos el DTO con solo los 2 campos que cambian.
+                # Usamos ``dataclasses.replace`` para no acoplar este
+                # código a la lista completa de campos del DTO (que
+                # puede haber crecido: sigrid_ide, gra_rep_ide, etc.).
+                contratos_with_maybe_reused[idx] = dataclasses.replace(
+                    old,
+                    pdf_sharepoint_relative_path=rel_path,
+                    pdf_sharepoint_web_url=web_url,
                 )
         elif any(c.gra_rep_ide is not None for c in contratos_with_maybe_reused):
             logger.info(
@@ -376,7 +398,7 @@ class ContratoEnrichmentService:
             return None
 
         # Hit: copiamos el contrato cacheado al merge usando
-        # upsert_contratos. Reusamos los paths del PDF si los tenía
+        # replace_contratos. Reusamos los paths del PDF si los tenía
         # cacheados (en cuyo caso ahorramos la subida a SharePoint).
         logger.info(
             "%s CACHE HIT obra=%s cif=%s fecha=%s -> codigo=%s "
@@ -395,7 +417,7 @@ class ContratoEnrichmentService:
         )
 
         try:
-            self._repository.upsert_contratos(
+            self._repository.replace_contratos(
                 document_id=merge_document_id,
                 contratos=[cached],
             )
@@ -414,17 +436,30 @@ class ContratoEnrichmentService:
         *,
         document_id: str,
         contrato: ContratoEnrichmentResult,
-    ) -> None:
+    ) -> tuple[str | None, str | None]:
         """Descarga + sube + actualiza BBDD para un contrato concreto.
 
         Silencia todas las excepciones: el objetivo es que un contrato
         con problema de PDF no impida procesar los otros. Lo grave se
         loguea como exception; lo esperado como warning.
+
+        Returns
+        -------
+        tuple[str | None, str | None]
+            ``(relative_path, web_url)`` si la descarga + subida + UPDATE
+            de BBDD ha ido bien. ``(None, None)`` en cualquier otro
+            caso (sin pdf_storage, sin gra_rep_ide, fallo de descarga,
+            fallo de subida o fallo de UPDATE).
+
+            El caller debe usar estos paths para reconstruir el DTO en
+            memoria (``ContratoEnrichmentResult`` es ``frozen=True``,
+            no se puede mutar). De lo contrario, el paso C (caché) verá
+            ``pdf_sharepoint_* = None`` y persistirá una caché inútil.
         """
         if self._pdf_storage is None:
-            return
+            return None, None
         if contrato.gra_rep_ide is None:
-            return
+            return None, None
 
         try:
             payload = self._client.download_contrato_pdf(
@@ -437,7 +472,7 @@ class ContratoEnrichmentService:
                 contrato.codigo_contrato,
                 contrato.gra_rep_ide,
             )
-            return
+            return None, None
 
         if payload is None:
             logger.warning(
@@ -446,7 +481,7 @@ class ContratoEnrichmentService:
                 contrato.codigo_contrato,
                 contrato.gra_rep_ide,
             )
-            return
+            return None, None
 
         try:
             stored = self._pdf_storage.upload_contrato_pdf(
@@ -462,7 +497,7 @@ class ContratoEnrichmentService:
                 contrato.codigo_contrato,
                 contrato.gra_rep_ide,
             )
-            return
+            return None, None
 
         try:
             self._repository.update_contrato_pdf_paths(
@@ -484,3 +519,11 @@ class ContratoEnrichmentService:
                 _LOG_PREFIX,
                 contrato.codigo_contrato,
             )
+            return None, None
+
+        # El UPDATE de BBDD ha ido bien. Devolvemos los paths al caller
+        # para que reconstruya el DTO en memoria. Si NO los propagara,
+        # el paso C (caché) escribiría pdf_sharepoint_* = None en
+        # contratos_cache y rompería la reutilización de PDFs en
+        # albaranes futuros que apunten al mismo contrato.
+        return stored.relative_path, stored.web_url
