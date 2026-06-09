@@ -308,6 +308,38 @@ class SigridApiContratoClient:
     # --------------------------------------------------------------- #
     # HTTP primitive para queries SQL
     # --------------------------------------------------------------- #
+    def search_proveedores(
+        self,
+        *,
+        max_rows: int = 5000,
+    ) -> list[tuple[str | None, str | None]]:
+        """Devuelve (cif, nombre) de los proveedores con contrato en la
+        empresa Ruesma (emp=1), para que el HeaderResolverService deduzca
+        el CIF por nombre cuando la IA no lo fijo. Best-effort.
+
+        ``ctr.entres`` es nvarchar -> DISTINCT es valido aqui.
+        """
+        sql = (
+            "SELECT DISTINCT ctr.entcif AS cif, ctr.entres AS nombre "
+            "FROM ctr "
+            "JOIN con ON ctr.ide = con.ide "
+            "WHERE ctr.entcif IS NOT NULL AND con.emp = 1"
+        )
+        columns, rows = self._post_sql_read(
+            sql=sql,
+            parameters=[],
+            database=self._database,
+            label="search_proveedores",
+        )
+        out: list[tuple[str | None, str | None]] = []
+        for row in rows:
+            row_map = dict(zip(columns, row))
+            cif = _opt_str(row_map.get("cif"))
+            nombre = _opt_str(row_map.get("nombre"))
+            if cif:
+                out.append((cif, nombre))
+        return out
+
     def _post_sql_read(
         self,
         *,

@@ -10,6 +10,7 @@ from application.services.albaran_normalizer import AlbaranNormalizer
 from application.services.contrato_enrichment_service import (
     ContratoEnrichmentService,
 )
+from application.services.header_resolver_service import HeaderResolverService
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from domain.models.extraction_models import (
     ExtractionEnvelope,
@@ -62,6 +63,7 @@ class PersistAlbaranPipeline:
         repository: AlbaranRepository,
         document_storage: DocumentStorage,
         normalizer: AlbaranNormalizer,
+        header_resolver_service: HeaderResolverService | None = None,
         obra_enrichment_service: ObraEnrichmentService | None = None,
         contrato_enrichment_service: ContratoEnrichmentService | None = None,
         valuation_trigger: ValuationTrigger | None = None,
@@ -69,6 +71,7 @@ class PersistAlbaranPipeline:
         self._repository = repository
         self._document_storage = document_storage
         self._normalizer = normalizer
+        self._header_resolver_service = header_resolver_service
         self._obra_enrichment_service = obra_enrichment_service
         self._contrato_enrichment_service = contrato_enrichment_service
         self._valuation_trigger = valuation_trigger
@@ -98,6 +101,9 @@ class PersistAlbaranPipeline:
             )
             # Re-enriquecer para idempotencia: si la BBDD on-prem cambió,
             # el merge se actualiza. No duplica contratos (replace).
+            self._resolve_header_deterministic_safely(
+                merge_document_id=existing.document_id,
+            )
             self._enrich_obra_safely(merge_document_id=existing.document_id)
             contratos_count = self._enrich_contratos_safely(
                 merge_document_id=existing.document_id,
@@ -171,6 +177,14 @@ class PersistAlbaranPipeline:
         #  3) Valoración: si hay selected_contrato_codigo con líneas,
         #     dispara /run-async del servicio 6 (fire-and-forget).
         # Todos los pasos son best-effort y no rompen la persistencia.
+        # 0) Resolucion determinista de cabecera: si la IA no fijo
+        #    obra_codigo / proveedor_cif, los deduce por texto contra
+        #    Sigrid y los persiste marcados 'deterministic'. Va ANTES del
+        #    enriquecimiento de obra (que necesita el codigo) para que la
+        #    valoracion inicial arranque ya con la propuesta.
+        self._resolve_header_deterministic_safely(
+            merge_document_id=saved.document_id,
+        )
         self._enrich_obra_safely(merge_document_id=saved.document_id)
         contratos_count = self._enrich_contratos_safely(
             merge_document_id=saved.document_id,
@@ -197,6 +211,27 @@ class PersistAlbaranPipeline:
             contratos_count=contratos_count,
             selected_contrato_codigo=selected_codigo,
         )
+
+    def _resolve_header_deterministic_safely(
+        self, *, merge_document_id: str,
+    ) -> None:
+        """Resolucion determinista de obra_codigo / proveedor_cif por
+        texto. Best-effort: nunca rompe la persistencia."""
+        if self._header_resolver_service is None:
+            logger.info(
+                "[header-resolver][pipeline] SKIP: servicio no cableado."
+            )
+            return
+        try:
+            self._header_resolver_service.resolve_merge_document(
+                merge_document_id=merge_document_id,
+            )
+        except Exception:
+            logger.exception(
+                "[header-resolver][pipeline] step falló; se continúa. "
+                "document_id=%s",
+                merge_document_id,
+            )
 
     def _enrich_obra_safely(self, *, merge_document_id: str) -> None:
         logger.info(

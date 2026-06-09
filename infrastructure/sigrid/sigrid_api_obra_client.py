@@ -31,6 +31,26 @@ WHERE con.cod = ?
 """
 
 
+# Reverse lookup: TODAS las obras con codigo, con nombre + direccion para
+# puntuar por texto en el HeaderResolverService. SIN DISTINCT (obr.res es
+# text/ntext y SQL Server no permite DISTINCT sobre ntext).
+_SQL_SEARCH_ALL = """\
+SELECT
+    con.cod        AS codigo_obra,
+    obr.res        AS nombre_obra,
+    obr.dir1       AS direccion_linea1,
+    obr.dir2       AS direccion_linea2,
+    obr.dircpo     AS codigo_postal,
+    mun.res        AS municipio,
+    pro.res        AS provincia
+FROM obr
+JOIN con ON obr.ide = con.ide
+LEFT JOIN auxmun mun ON obr.munide = mun.ide
+LEFT JOIN auxpro pro ON obr.proide = pro.ide
+WHERE con.cod IS NOT NULL
+"""
+
+
 class SigridApiObraClient:
     """Adaptador HTTP contra la Function App ``sigrid-api``.
 
@@ -235,6 +255,56 @@ class SigridApiObraClient:
             return None
 
         return chosen
+
+    def search_obras(
+        self,
+        *,
+        max_rows: int = 5000,
+    ) -> list[ObraEnrichmentResult]:
+        """Devuelve TODAS las obras (codigo + nombre + direccion) para que
+        el HeaderResolverService puntue por texto y proponga el codigo
+        cuando la IA no lo fijo. Best-effort: ante error devuelve [].
+        """
+        url = f"{self._base_url}/api/sql/read"
+        payload = {
+            "database": self._database,
+            "sql": _SQL_SEARCH_ALL,
+            "parameters": [],
+            "timeout_seconds": int(self._timeout_s),
+            "max_rows": int(max_rows),
+        }
+        headers = {
+            "x-functions-key": self._function_key,
+            "Content-Type": "application/json",
+        }
+        logger.info(
+            "%s SEARCH_OBRAS -> POST %s database=%s max_rows=%s",
+            _LOG_PREFIX, url, self._database, max_rows,
+        )
+        transport = httpx.HTTPTransport(retries=1)
+        with httpx.Client(timeout=self._timeout_s, transport=transport) as client:
+            response = client.post(url, json=payload, headers=headers)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"sigrid-api respondio {response.status_code}: "
+                f"{(response.text or '')[:300]}"
+            )
+        body: dict[str, Any] = response.json()
+        if not body.get("ok", False):
+            raise RuntimeError(f"sigrid-api devolvio ok=false: {body!r}")
+        columns: list[str] = list(body.get("columns") or [])
+        rows: list[list[Any]] = list(body.get("rows") or [])
+        logger.info(
+            "%s SEARCH_OBRAS <- %s filas.", _LOG_PREFIX, len(rows),
+        )
+        results: list[ObraEnrichmentResult] = []
+        for row in rows:
+            res = self._row_to_result(
+                row=row, columns=columns, codigo_fallback="",
+            )
+            if (res.codigo_obra or "").strip():
+                results.append(res)
+        return results
 
     @staticmethod
     def _row_to_result(

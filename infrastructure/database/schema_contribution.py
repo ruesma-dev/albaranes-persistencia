@@ -344,16 +344,33 @@ def _alter_columns_for_sigrid_ide_upsert() -> List[Tuple[str, str]]:
     # ADD CONSTRAINT en PostgreSQL no soporta IF NOT EXISTS sin DO
     # block. Funcionalmente es equivalente para ON CONFLICT.
     statements.extend([
-        ("INDEX uq_albaran_contratos_merge_sigrid_ide",
+        # MERGE — Opcion B: unicidad PER-DOCUMENTO. Antes el UNIQUE era
+        # global por ``sigrid_ide`` y UNA sola fila describia el contrato
+        # para TODOS los albaranes; su ``document_id`` quedaba con el del
+        # ultimo enriquecido, y los demas albaranes no encontraban su
+        # cabecera por ``document_id`` (404 al valorar / auto-trigger
+        # saltado). Ahora cada albaran tiene su propia fila:
+        #   * cabecera UNIQUE (document_id, sigrid_ide)
+        #   * lineas   UNIQUE (contrato_id, sigrid_ide)
+        # Se eliminan los indices globales legacy y se crean los nuevos.
+        # El cambio es estricto->laxo, asi que NO viola los datos
+        # existentes (lo unico por sigrid_ide tambien lo es por la tupla).
+        ("DROP INDEX uq_albaran_contratos_merge_sigrid_ide (legacy global)",
+         "DROP INDEX IF EXISTS uq_albaran_contratos_merge_sigrid_ide"),
+        ("INDEX uq_albaran_contratos_merge_doc_sigrid",
          "CREATE UNIQUE INDEX IF NOT EXISTS "
-         "uq_albaran_contratos_merge_sigrid_ide "
-         "ON albaran_contratos_merge (sigrid_ide) "
+         "uq_albaran_contratos_merge_doc_sigrid "
+         "ON albaran_contratos_merge (document_id, sigrid_ide) "
          "WHERE sigrid_ide IS NOT NULL"),
-        ("INDEX uq_albaran_contrato_lines_merge_sigrid_ide",
+        ("DROP INDEX uq_albaran_contrato_lines_merge_sigrid_ide (legacy global)",
+         "DROP INDEX IF EXISTS uq_albaran_contrato_lines_merge_sigrid_ide"),
+        ("INDEX uq_albaran_contrato_lines_merge_contrato_sigrid",
          "CREATE UNIQUE INDEX IF NOT EXISTS "
-         "uq_albaran_contrato_lines_merge_sigrid_ide "
-         "ON albaran_contrato_lines_merge (sigrid_ide) "
+         "uq_albaran_contrato_lines_merge_contrato_sigrid "
+         "ON albaran_contrato_lines_merge (contrato_id, sigrid_ide) "
          "WHERE sigrid_ide IS NOT NULL"),
+        # CACHE GLOBAL — se mantiene UNIQUE por sigrid_ide: el cache SI es
+        # one-per-contract (no esta ligado a ningun albaran).
         ("INDEX uq_contratos_cache_sigrid_ide",
          "CREATE UNIQUE INDEX IF NOT EXISTS "
          "uq_contratos_cache_sigrid_ide "

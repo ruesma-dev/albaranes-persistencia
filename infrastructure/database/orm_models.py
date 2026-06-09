@@ -139,6 +139,14 @@ class AlbaranDocumentMergeOrm(_DocumentColumnsMixin, Base):
         ),
     )
 
+    # Origen de obra_codigo / proveedor_cif. SOLO en el merge (no en la
+    # tabla cruda por-proveedor 'albaran_documents'). Valores:
+    #   'ia' | 'deterministic' | 'manual' | NULL.
+    # Lo escribe el HeaderResolverService (sv3); el DDL idempotente de
+    # phase2_ddl.py añade estas 2 columnas a albaran_documents_merge.
+    obra_codigo_origen: Mapped[str | None] = mapped_column(String(24))
+    proveedor_cif_origen: Mapped[str | None] = mapped_column(String(24))
+
     lines: Mapped[list["AlbaranLineMergeOrm"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",

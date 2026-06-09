@@ -49,6 +49,7 @@ from application.services.contrato_enrichment_service import (
 from application.services.contrato_refetch_service import (
     ContratoRefetchService,
 )
+from application.services.header_resolver_service import HeaderResolverService
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from application.services.phase2_persistence_service import (
     Phase2PersistenceService,
@@ -120,6 +121,7 @@ def build_app(settings: Settings) -> FastAPI:
     # Sigrid — enriquecimiento obra + contrato.
     # Solo se cablean si las 3 credenciales están presentes.
     # ----------------------------------------------------------- #
+    header_resolver_service: HeaderResolverService | None = None
     obra_enrichment_service: ObraEnrichmentService | None = None
     contrato_enrichment_service: ContratoEnrichmentService | None = None
     contrato_refetch_service: ContratoRefetchService | None = None
@@ -136,6 +138,17 @@ def build_app(settings: Settings) -> FastAPI:
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
+        )
+
+        # Resolucion determinista de cabecera (obra_codigo / proveedor_cif
+        # por texto) cuando la IA no los fijo. Reusa los mismos clientes
+        # Sigrid (search_obras / search_proveedores).
+        header_resolver_service = HeaderResolverService(
+            obra_client=sigrid_obra_client,
+            proveedor_client=sigrid_contrato_client,
+            repository=repository,
+            min_score=settings.header_resolver_min_score,
+            enabled=settings.header_resolver_enabled,
         )
 
         obra_enrichment_service = ObraEnrichmentService(
@@ -216,6 +229,7 @@ def build_app(settings: Settings) -> FastAPI:
         repository=repository,
         document_storage=document_storage,
         normalizer=AlbaranNormalizer(),
+        header_resolver_service=header_resolver_service,
         obra_enrichment_service=obra_enrichment_service,
         contrato_enrichment_service=contrato_enrichment_service,
         valuation_trigger=valuation_trigger,
@@ -336,6 +350,12 @@ def build_app(settings: Settings) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
+            # Logueamos la traza COMPLETA para diagnostico (antes solo se
+            # devolvia el mensaje en 'detail' y la consola no mostraba nada).
+            logger.exception(
+                "[svc3] persist FALLO filename=%s; devolviendo 500.",
+                file.filename,
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Error persistiendo albarán: {exc}",

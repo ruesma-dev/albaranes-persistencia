@@ -22,6 +22,7 @@ from domain.models.extraction_models import (
     LineaAlbaran,
     ProviderExtractionEnvelope,
 )
+from domain.models.header_resolution_models import MergeHeaderForResolution
 from domain.models.persistence_models import ExistingDocument, StoredFile
 from domain.ports.albaran_repository import AlbaranRepository
 from infrastructure.database.orm_contrato_models import (
@@ -602,6 +603,70 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             session.commit()
 
     # ================================================================== #
+    # Puerto HeaderMergeRepository (resolucion determinista de cabecera)
+    # ================================================================== #
+    def get_merge_header_for_resolution(
+        self,
+        *,
+        document_id: str,
+    ) -> MergeHeaderForResolution | None:
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                return None
+            return MergeHeaderForResolution(
+                obra_codigo=document.obra_codigo,
+                obra_nombre=document.obra_nombre,
+                obra_direccion=document.obra_direccion,
+                proveedor_cif=document.proveedor_cif,
+                proveedor_nombre=document.proveedor_nombre,
+            )
+
+    def update_merge_resolved_header(
+        self,
+        *,
+        document_id: str,
+        obra_codigo_det: str | None,
+        proveedor_cif_det: str | None,
+    ) -> None:
+        """Persiste la resolucion determinista de cabecera de forma
+        CONSERVADORA:
+          - obra_codigo: si esta vacio y hay deduccion -> se fija y
+            origen='deterministic'. Si ya habia codigo y el origen estaba
+            sin marcar -> origen='ia'. Nunca pisa un origen 'manual' ni un
+            codigo existente.
+          - proveedor_cif: misma logica.
+        """
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                raise KeyError(f"Documento merge no encontrado: {document_id}")
+
+            # El resolver SOLO devuelve *_det cuando decidio que el dato
+            # actual falta o no es valido. Por eso, si llega un *_det, se
+            # aplica (salvo que el revisor lo hubiera fijado a 'manual').
+            # Si no llega *_det pero ya habia dato sin marcar -> 'ia'.
+            cur_code = (document.obra_codigo or "").strip()
+            cur_code_origen = (document.obra_codigo_origen or "").strip()
+            if obra_codigo_det and cur_code_origen != "manual":
+                document.obra_codigo = obra_codigo_det
+                document.obra_codigo_origen = "deterministic"
+            elif cur_code and not cur_code_origen:
+                document.obra_codigo_origen = "ia"
+
+            cur_cif = (document.proveedor_cif or "").strip()
+            cur_cif_origen = (document.proveedor_cif_origen or "").strip()
+            if proveedor_cif_det and cur_cif_origen != "manual":
+                document.proveedor_cif = proveedor_cif_det
+                document.proveedor_cif_origen = "deterministic"
+            elif cur_cif and not cur_cif_origen:
+                document.proveedor_cif_origen = "ia"
+
+            session.commit()
+
+    # ================================================================== #
     # Puerto ContratoMergeRepository (cumplido por duck-typing)
     # ================================================================== #
     def get_merge_cif_and_obra(
@@ -759,10 +824,15 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         (sigrid_ide) DO UPDATE``: cuando el contrato ya existe se
         actualiza con los datos más frescos; cuando no, se inserta.
 
-        Comportamiento clave:
-          * ``document_id`` se sobrescribe en UPDATE con el del albarán
-            actual (opción B confirmada por el usuario): siempre el
-            albarán más reciente que ha tocado este contrato.
+        Comportamiento clave (opción B — una fila de contrato POR
+        DOCUMENTO):
+          * La clave de UPSERT de la cabecera es ``(document_id,
+            sigrid_ide)`` y la de las líneas ``(contrato_id,
+            sigrid_ide)``: cada albarán tiene su PROPIA cabecera/líneas
+            del contrato, con su ``document_id`` correcto. Antes la clave
+            era solo ``sigrid_ide`` (una fila compartida) y el
+            ``document_id`` quedaba con el del último albarán, rompiendo
+            las búsquedas por documento.
           * Las líneas existentes que NO aparecen ya en la respuesta
             de Sigrid de hoy NO se borran. Si Sigrid quitara una línea
             (no debería pasar), preferimos conservarla histórica que
@@ -933,13 +1003,13 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             "fetched_at_utc": now,
         }
         stmt = pg_insert(AlbaranContratoMergeOrm).values(**values)
-        # Columnas a refrescar en conflicto: TODAS menos la clave
-        # (sigrid_ide). En particular, document_id se sobrescribe
-        # con el del albarán actual (opción B).
+        # Columnas a refrescar en conflicto: TODAS menos la CLAVE, que
+        # ahora es (document_id, sigrid_ide). document_id forma parte de
+        # la clave (opción B: una fila de contrato POR DOCUMENTO), así
+        # que no se actualiza aquí.
         update_columns = {
             col: getattr(stmt.excluded, col)
             for col in (
-                "document_id",
                 "codigo_contrato",
                 "nombre_contrato",
                 "fecha_alta_contrato",
@@ -958,7 +1028,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
         }
         stmt = stmt.on_conflict_do_update(
-            index_elements=["sigrid_ide"],
+            index_elements=["document_id", "sigrid_ide"],
             index_where=text("sigrid_ide IS NOT NULL"),
             set_=update_columns,
         ).returning(AlbaranContratoMergeOrm.id)
@@ -1052,11 +1122,9 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         update_columns = {
             col: getattr(stmt.excluded, col)
             for col in (
-                # Importante: contrato_id también se actualiza, porque
-                # si la cabecera del contrato se "movió" a otra fila
-                # (no debería, pero por completitud) la línea va con
-                # ella.
-                "contrato_id",
+                # contrato_id forma parte de la CLAVE (contrato_id,
+                # sigrid_ide): cada cabecera por-documento tiene su propia
+                # copia de la línea, así que NO se actualiza aquí.
                 "codigo_contrato",
                 "linea",
                 "numero_linea",
@@ -1080,7 +1148,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             )
         }
         stmt = stmt.on_conflict_do_update(
-            index_elements=["sigrid_ide"],
+            index_elements=["contrato_id", "sigrid_ide"],
             index_where=text("sigrid_ide IS NOT NULL"),
             set_=update_columns,
         )

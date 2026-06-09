@@ -51,6 +51,12 @@ _PHASE2_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_albaran_documents_merge_review_phase2_status "
     "ON albaran_documents_merge(review_phase2_status)",
 
+    # Origen determinista de cabecera (obra_codigo / proveedor_cif).
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS obra_codigo_origen VARCHAR(24)",
+    "ALTER TABLE albaran_documents_merge "
+    "ADD COLUMN IF NOT EXISTS proveedor_cif_origen VARCHAR(24)",
+
     # albaran_lines_merge
     "ALTER TABLE albaran_lines_merge "
     "ADD COLUMN IF NOT EXISTS source_phase VARCHAR(16) "

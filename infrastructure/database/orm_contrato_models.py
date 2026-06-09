@@ -25,29 +25,25 @@ class AlbaranContratoMergeOrm(Base):
     ubicación del PDF ya subido a SharePoint (rellenados tras la
     descarga+subida automática en el enrichment).
 
-    ``sigrid_ide`` = ``ctr.ide`` en Sigrid (INDICE PRIMARIO, entero).
-    Identifica el contrato en el ERP de forma estable. Se usa como
-    clave de UPSERT: cuando llega un albarán nuevo cuyo enriquecimiento
-    devuelve un contrato con el mismo ``sigrid_ide`` que ya existe en
-    BBDD, se ACTUALIZA en lugar de duplicar. Es UNIQUE para garantizar
-    que la BBDD nunca tenga dos filas describiendo el mismo contrato
-    del ERP.
+    ``sigrid_ide`` = ``ctr.ide`` en Sigrid (entero, estable). Junto con
+    ``document_id`` forma la clave de UPSERT: la unicidad es
+    ``(document_id, sigrid_ide)`` (opción B), de modo que CADA albarán
+    tiene su PROPIA fila para el contrato. Re-enriquecer el MISMO albarán
+    ACTUALIZA su fila; otro albarán que traiga el mismo contrato del ERP
+    crea su propia fila. Antes la clave era solo ``sigrid_ide`` (una
+    única fila compartida entre albaranes), lo que rompía las búsquedas
+    de cabecera por ``document_id``.
 
-    NOTA — El UNIQUE de ``sigrid_ide`` NO se declara aquí con
-    ``unique=True``. Se crea desde ``schema_contribution.py`` como
-    ``CREATE UNIQUE INDEX ... WHERE sigrid_ide IS NOT NULL``. Razón:
-    queremos permitir múltiples filas legacy con ``sigrid_ide = NULL``
-    (filas anteriores al refactor que aún no han sido re-enriquecidas
-    desde Sigrid). Un UNIQUE clásico aceptaría también múltiples NULLs
-    en PostgreSQL, pero el índice parcial es más explícito sobre la
-    intención.
+    NOTA — El UNIQUE NO se declara aquí con ``unique=True``. Se crea
+    desde ``schema_contribution.py`` como
+    ``CREATE UNIQUE INDEX ... (document_id, sigrid_ide)
+    WHERE sigrid_ide IS NOT NULL``. El índice parcial permite múltiples
+    filas legacy con ``sigrid_ide = NULL`` (anteriores al refactor).
 
-    ``document_id`` ya NO es la clave de identidad del contrato (lo es
-    ``sigrid_ide``). Se mantiene por trazabilidad: indica qué albarán
-    tocó este contrato más recientemente. Es nullable y la FK ahora es
-    ``ON DELETE SET NULL`` para permitir que un albarán se borre sin
-    arrastrar contratos que pueden estar siendo referenciados por
-    otros albaranes.
+    ``document_id`` forma parte de la identidad del contrato POR
+    DOCUMENTO. La FK es ``ON DELETE SET NULL`` (nullable) por seguridad
+    en borrados; en la práctica cada albarán posee sus propias filas, así
+    que borrar un albarán solo afecta a las suyas.
     """
 
     __tablename__ = "albaran_contratos_merge"
@@ -97,11 +93,11 @@ class AlbaranContratoLineMergeOrm(Base):
 
     Incluye partida (``obrparpar.cod`` / ``obrparpar.res``).
 
-    ``sigrid_ide`` = ``ctrpro.ide`` en Sigrid (INDICE PRIMARIO, entero).
-    Identifica la línea en el ERP de forma estable. Se usa como clave
-    de UPSERT: una misma línea (mismo ``ctrpro.ide``) se actualiza en
-    lugar de duplicar. UNIQUE parcial (WHERE sigrid_ide IS NOT NULL)
-    para permitir múltiples NULLs históricos — ver comentario en
+    ``sigrid_ide`` = ``ctrpro.ide`` en Sigrid (entero, estable). La clave
+    de UPSERT es ``(contrato_id, sigrid_ide)``: cada cabecera
+    por-documento tiene su propia copia de la línea, así que la misma
+    línea del ERP aparece una vez POR cabecera. UNIQUE parcial (WHERE
+    sigrid_ide IS NOT NULL) para permitir NULLs históricos — ver
     ``AlbaranContratoMergeOrm.sigrid_ide``.
     """
 

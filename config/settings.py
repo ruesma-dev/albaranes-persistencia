@@ -124,6 +124,17 @@ class Settings(BaseSettings):
         alias="OBRA_ENRICHMENT_ENABLED",
     )
 
+    # Resolucion determinista de cabecera (obra_codigo / proveedor_cif
+    # por coincidencia de texto contra Sigrid cuando la IA no los fijo).
+    header_resolver_enabled: bool = Field(
+        True,
+        alias="HEADER_RESOLVER_ENABLED",
+    )
+    header_resolver_min_score: float = Field(
+        0.5,
+        alias="HEADER_RESOLVER_MIN_SCORE",
+    )
+
     # ------------------------------------------------------------ #
     # Valuation trigger (sv6).
     #
