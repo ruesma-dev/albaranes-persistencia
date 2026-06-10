@@ -109,3 +109,17 @@ class ContratoMergeRepository(Protocol):
         si el documento no existe en ``albaran_documents_merge``.
         """
         ...
+
+    def update_merge_proveedor_nombre(
+        self,
+        *,
+        document_id: str,
+        nombre_proveedor: str,
+    ) -> bool:
+        """Sobrescribe ``proveedor_nombre`` de la cabecera con la razón
+        social canónica de Sigrid (``prv.raz``) obtenida al resolver el
+        contrato por CIF. Devuelve True si cambió el valor, False si fue
+        no-op (nombre vacío o idéntico). Levanta ``KeyError`` si el
+        documento no existe.
+        """
+        ...

@@ -666,6 +666,41 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
 
             session.commit()
 
+    def update_merge_proveedor_nombre(
+        self,
+        *,
+        document_id: str,
+        nombre_proveedor: str,
+    ) -> bool:
+        """Sobrescribe el NOMBRE del proveedor de la cabecera del merge
+        con la razon social canonica de Sigrid (``prv.raz``), obtenida al
+        resolver el contrato por CIF en el enrichment/refetch.
+
+        Corrige el nombre que la 1a fase IA leyo del albaran, que suele
+        venir abreviado o mal escrito (p.ej. "de obras Mostoles, s.l."
+        en vez de "Suministros de Obras Mostoles S.L."). Se sobrescribe
+        porque, si hemos localizado un contrato por (CIF, obra), el
+        proveedor de ese contrato ES el del albaran y su razon social en
+        ficha es la fuente de verdad.
+
+        Devuelve True si actualizo el campo; False (no-op) si el nombre
+        llega vacio o es identico al que ya habia. Levanta ``KeyError``
+        si el documento no existe.
+        """
+        nombre = (nombre_proveedor or "").strip()
+        if not nombre:
+            return False
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                raise KeyError(f"Documento merge no encontrado: {document_id}")
+            if (document.proveedor_nombre or "").strip() == nombre:
+                return False
+            document.proveedor_nombre = nombre
+            session.commit()
+            return True
+
     # ================================================================== #
     # Puerto ContratoMergeRepository (cumplido por duck-typing)
     # ================================================================== #

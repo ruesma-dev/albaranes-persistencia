@@ -250,6 +250,44 @@ class ContratoEnrichmentService:
             logger.exception("%s ERROR guardando contratos.", _LOG_PREFIX)
             return 0
 
+        # Paso 6-bis: sobrescribir el NOMBRE del proveedor de la CABECERA
+        # del albarán con la razón social canónica de Sigrid (``prv.raz``),
+        # que viaja en los contratos recién resueltos por CIF. Es el punto
+        # en que "accedemos a la info del proveedor por su CIF", así que es
+        # donde corregimos el nombre que la 1ª fase IA leyó del albarán
+        # (a menudo abreviado/mal escrito). Best-effort: si falla, NO rompe
+        # el enrichment (los contratos ya están guardados). Se protege con
+        # hasattr para no romper repos/mocks que no implementen el método.
+        nombre_canonico = next(
+            (
+                (c.nombre_proveedor or "").strip()
+                for c in contratos
+                if (c.nombre_proveedor or "").strip()
+            ),
+            "",
+        )
+        if nombre_canonico and hasattr(
+            self._repository, "update_merge_proveedor_nombre"
+        ):
+            try:
+                actualizado = self._repository.update_merge_proveedor_nombre(
+                    document_id=merge_document_id,
+                    nombre_proveedor=nombre_canonico,
+                )
+                if actualizado:
+                    logger.info(
+                        "%s proveedor_nombre de la cabecera sobrescrito con "
+                        "la razón social canónica de Sigrid: %r",
+                        _LOG_PREFIX,
+                        nombre_canonico,
+                    )
+            except Exception:
+                logger.exception(
+                    "%s No se pudo sobrescribir proveedor_nombre (no afecta "
+                    "al enrichment).",
+                    _LOG_PREFIX,
+                )
+
         # Paso 7: descargar + subir PDFs pendientes, y actualizar paths.
         #
         # IMPORTANTE: _download_and_store_pdf devuelve los paths

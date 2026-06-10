@@ -50,7 +50,7 @@ SELECT
     ctr.fecvig2         AS vigencia_hasta,
     ctr.totbas          AS importe_total,
     ctr.entcif          AS cif_proveedor,
-    ctr.entres          AS nombre_proveedor,
+    prv.raz             AS nombre_proveedor,
     con_obr.cod         AS codigo_obra,
     con_obr.res         AS nombre_obra,
     ctrpro.ide          AS line_ide,
