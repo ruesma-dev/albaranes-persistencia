@@ -186,6 +186,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS review_required BOOLEAN",
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS review_reasons_json TEXT",
                     f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS comparison_summary_json TEXT",
+                    # Soft-delete (jun 2026): borrado lógico + auditoría.
+                    # is_active NOT NULL DEFAULT true marca como activas las
+                    # filas existentes al migrar.
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true",
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS deleted_at_utc VARCHAR(64)",
+                    f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255)",
                     (
                         f"UPDATE {table_name} SET source_document_id = source_sha256 "
                         "WHERE source_document_id IS NULL"
@@ -266,9 +272,41 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "ALTER TABLE albaran_documents_merge "
                 "DROP CONSTRAINT IF EXISTS albaran_documents_gem_source_sha256_key"
             ),
+            # ------------------------------------------------------------ #
+            # Soft-delete (jun 2026): unicidad por source_sha256 como ÍNDICE
+            # PARCIAL «WHERE is_active».
+            #
+            # Migramos los UNIQUE globales a índices parciales: un albarán
+            # borrado (is_active=false) deja de ocupar el "slot único", de
+            # modo que el mismo PDF puede re-ingerirse creando uno nuevo
+            # activo sin violar integridad. Cubrimos las dos formas posibles
+            # (DROP CONSTRAINT y DROP INDEX) porque, según la versión, la
+            # unicidad podía existir como constraint del ORM o como índice
+            # creado a mano con el mismo nombre.
+            # ------------------------------------------------------------ #
+            # Tabla cruda por-proveedor (source_sha256, provider_origin).
             (
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_albaran_documents_sha_provider "
-                "ON albaran_documents (source_sha256, provider_origin)"
+                "ALTER TABLE albaran_documents "
+                "DROP CONSTRAINT IF EXISTS uq_albaran_documents_sha_provider"
+            ),
+            "DROP INDEX IF EXISTS uq_albaran_documents_sha_provider",
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_albaran_documents_sha_provider_active "
+                "ON albaran_documents (source_sha256, provider_origin) "
+                "WHERE is_active"
+            ),
+            # Tabla merge (la que consume sv4 y el dedup get_by_sha256).
+            (
+                "ALTER TABLE albaran_documents_merge "
+                "DROP CONSTRAINT IF EXISTS uq_albaran_documents_merge_sha"
+            ),
+            "DROP INDEX IF EXISTS uq_albaran_documents_merge_sha",
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_albaran_documents_merge_sha_active "
+                "ON albaran_documents_merge (source_sha256) "
+                "WHERE is_active"
             ),
             (
                 "CREATE INDEX IF NOT EXISTS ix_albaran_contratos_merge_document "
@@ -301,6 +339,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             result_document = session.scalar(
                 select(AlbaranDocumentMergeOrm).where(
                     AlbaranDocumentMergeOrm.source_sha256 == source_sha256,
+                    # Soft-delete (jun 2026): un albarán borrado (papelera)
+                    # NO cuenta como "ya existe", así que el mismo PDF se
+                    # re-procesa creando uno nuevo activo. El índice único
+                    # parcial «WHERE is_active» garantiza que no haya choque
+                    # de claves con el borrado que sigue en la tabla.
+                    AlbaranDocumentMergeOrm.is_active.is_(True),
                 )
             )
             if result_document is None:
@@ -665,41 +709,6 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 document.proveedor_cif_origen = "ia"
 
             session.commit()
-
-    def update_merge_proveedor_nombre(
-        self,
-        *,
-        document_id: str,
-        nombre_proveedor: str,
-    ) -> bool:
-        """Sobrescribe el NOMBRE del proveedor de la cabecera del merge
-        con la razon social canonica de Sigrid (``prv.raz``), obtenida al
-        resolver el contrato por CIF en el enrichment/refetch.
-
-        Corrige el nombre que la 1a fase IA leyo del albaran, que suele
-        venir abreviado o mal escrito (p.ej. "de obras Mostoles, s.l."
-        en vez de "Suministros de Obras Mostoles S.L."). Se sobrescribe
-        porque, si hemos localizado un contrato por (CIF, obra), el
-        proveedor de ese contrato ES el del albaran y su razon social en
-        ficha es la fuente de verdad.
-
-        Devuelve True si actualizo el campo; False (no-op) si el nombre
-        llega vacio o es identico al que ya habia. Levanta ``KeyError``
-        si el documento no existe.
-        """
-        nombre = (nombre_proveedor or "").strip()
-        if not nombre:
-            return False
-        self.initialize()
-        with self._session_factory.create_session() as session:
-            document = session.get(AlbaranDocumentMergeOrm, document_id)
-            if document is None:
-                raise KeyError(f"Documento merge no encontrado: {document_id}")
-            if (document.proveedor_nombre or "").strip() == nombre:
-                return False
-            document.proveedor_nombre = nombre
-            session.commit()
-            return True
 
     # ================================================================== #
     # Puerto ContratoMergeRepository (cumplido por duck-typing)

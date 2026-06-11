@@ -8,7 +8,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -48,6 +47,31 @@ class _DocumentColumnsMixin:
     sharepoint_share_url: Mapped[str | None] = mapped_column(String(1024))
     ia_input_json: Mapped[str | None] = mapped_column(Text)
     ia_output_json: Mapped[str | None] = mapped_column(Text)
+
+    # ------------------------------------------------------------------ #
+    # Soft-delete (jun 2026)
+    #
+    # is_active=False marca un albarán como "borrado" desde la portada de
+    # revisión (sv4) sin eliminarlo físicamente: mantiene auditoría,
+    # historial y permite restaurarlo desde la papelera.
+    #
+    # CLAVE DE INTEGRIDAD: la unicidad por source_sha256 (y por
+    # source_sha256+provider_origin en la tabla cruda) deja de ser global y
+    # pasa a ser un ÍNDICE ÚNICO PARCIAL ``WHERE is_active`` (ver el DDL en
+    # sqlalchemy_albaran_repository._ensure_compatible_schema). Así puede
+    # coexistir UN activo por sha256 con N inactivos del mismo sha256 (las
+    # versiones borradas), de modo que re-ingerir un PDF cuyo albarán se
+    # borró NO viola la unicidad. El dedup (get_by_sha256) prefiltra por
+    # is_active, así que un albarán borrado no cuenta como "ya existe".
+    #
+    # Por eso los UniqueConstraint del ORM se han retirado: la unicidad la
+    # gobierna íntegramente el DDL idempotente como índice parcial.
+    # ------------------------------------------------------------------ #
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    deleted_at_utc: Mapped[str | None] = mapped_column(String(64))
+    deleted_by: Mapped[str | None] = mapped_column(String(255))
     ia_input_relative_path: Mapped[str | None] = mapped_column(String(1024))
     ia_input_web_url: Mapped[str | None] = mapped_column(String(1024))
     ia_output_relative_path: Mapped[str | None] = mapped_column(String(1024))
@@ -103,13 +127,10 @@ class _LineColumnsMixin:
 
 class AlbaranDocumentOrm(_DocumentColumnsMixin, Base):
     __tablename__ = "albaran_documents"
-    __table_args__ = (
-        UniqueConstraint(
-            "source_sha256",
-            "provider_origin",
-            name="uq_albaran_documents_sha_provider",
-        ),
-    )
+    # Unicidad (source_sha256, provider_origin) gestionada como ÍNDICE
+    # ÚNICO PARCIAL «WHERE is_active» en el DDL idempotente
+    # (_ensure_compatible_schema), no como constraint global, para que el
+    # soft-delete permita re-ingerir un PDF borrado sin violar unicidad.
 
     lines: Mapped[list["AlbaranLineOrm"]] = relationship(
         back_populates="document",
@@ -132,12 +153,10 @@ class AlbaranLineOrm(_LineColumnsMixin, Base):
 
 class AlbaranDocumentMergeOrm(_DocumentColumnsMixin, Base):
     __tablename__ = "albaran_documents_merge"
-    __table_args__ = (
-        UniqueConstraint(
-            "source_sha256",
-            name="uq_albaran_documents_merge_sha",
-        ),
-    )
+    # Unicidad por source_sha256 gestionada como ÍNDICE ÚNICO PARCIAL
+    # «WHERE is_active» en el DDL idempotente (_ensure_compatible_schema),
+    # no como constraint global: así un albarán borrado (is_active=false)
+    # no ocupa el "slot único" y el mismo PDF puede re-ingerirse.
 
     # Origen de obra_codigo / proveedor_cif. SOLO en el merge (no en la
     # tabla cruda por-proveedor 'albaran_documents'). Valores:
