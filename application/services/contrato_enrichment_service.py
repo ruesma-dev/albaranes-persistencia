@@ -159,6 +159,15 @@ class ContratoEnrichmentService:
                         "%s ERROR auto-seleccionando contrato cacheado.",
                         _LOG_PREFIX,
                     )
+                # Canonización del nombre del proveedor TAMBIÉN en hit de
+                # caché (jun 2026). Antes el nombre canónico solo llegaba
+                # en el camino Sigrid; los hits de caché del pipeline
+                # automático dejaban la cabecera con el nombre leído por
+                # la IA (limitación conocida, ahora cerrada).
+                self._canonize_proveedor_nombre_safely(
+                    merge_document_id=merge_document_id,
+                    nombre_proveedor=cached.nombre_proveedor,
+                )
                 return 1
             # Cache miss → continúa al flujo original (Sigrid).
 
@@ -178,6 +187,22 @@ class ContratoEnrichmentService:
             "%s Sigrid devolvió %s contrato(s)", _LOG_PREFIX, len(contratos)
         )
 
+        # ------------------------------------------------------------ #
+        # Canonización del nombre del proveedor (jun 2026).
+        #
+        # El SQL de contratos devuelve ahora la razón social CANÓNICA
+        # del maestro (``prv.raz``). Al confirmarse que el CIF del merge
+        # existe en Sigrid (hay contratos), sobrescribimos
+        # ``proveedor_nombre`` de la cabecera con ese canónico — es la
+        # pieza que el puerto ``update_merge_proveedor_nombre``
+        # declaraba pero que nunca llegó a cablearse.
+        # ------------------------------------------------------------ #
+        if contratos:
+            self._canonize_proveedor_nombre_safely(
+                merge_document_id=merge_document_id,
+                nombre_proveedor=contratos[0].nombre_proveedor,
+            )
+
         # Paso 4: mapa de PDFs ya guardados ANTES del replace.
         # Si el repo no implementa get_existing_pdf_paths (caso de
         # compatibilidad hacia atrás con mocks), se queda vacío.
@@ -192,6 +217,29 @@ class ContratoEnrichmentService:
                 _LOG_PREFIX,
             )
 
+        # Paso 4-bis (jun 2026): segundo nivel de reutilizacion — la
+        # CACHE GLOBAL (contratos_cache). Cubre el caso "cambie de
+        # contrato/obra y volvi": el replace de contratos del documento
+        # pudo borrar las filas locales (y sus paths), pero la cache
+        # global conserva el PDF por (obra, cif, codigo_contrato). Si el
+        # gra_rep_ide sigue siendo el mismo, se reutiliza sin descargar.
+        cache_pdfs: dict[str, tuple[int | None, str | None, str | None]] = {}
+        if self._cache is not None:
+            try:
+                cache_pdfs = self._cache.get_pdf_paths_for_codigos(
+                    codigo_obra=obra_norm,
+                    cif_proveedor=cif_clean,
+                    codigos=[c.codigo_contrato for c in contratos],
+                )
+            except AttributeError:
+                # Implementaciones/mocks antiguos sin el metodo: se ignora.
+                cache_pdfs = {}
+            except Exception:
+                logger.exception(
+                    "%s No se pudo leer PDFs de la cache global; se ignora.",
+                    _LOG_PREFIX,
+                )
+
         # Paso 5: si el gra_rep_ide del contrato nuevo coincide con el
         # previo, reutilizamos los paths directamente en el DTO para
         # que el replace los persista sin tener que volver a subir.
@@ -199,7 +247,20 @@ class ContratoEnrichmentService:
         contratos_with_maybe_reused: list[ContratoEnrichmentResult] = []
         pending_pdf_indices: list[int] = []  # índices en contratos_with_maybe_reused
         for idx, contrato in enumerate(contratos):
+            # Nivel 1: PDFs ya guardados en ESTE documento. Nivel 2: la
+            # cache global (otro albaran o una seleccion anterior). En
+            # ambos casos la identidad es (codigo_contrato, gra_rep_ide):
+            # si Sigrid cambio el documento del contrato (gra_rep_ide
+            # distinto), NO se reutiliza y se vuelve a descargar.
             prev = existing_pdfs.get(contrato.codigo_contrato)
+            if not (
+                prev is not None
+                and prev[0] is not None
+                and contrato.gra_rep_ide is not None
+                and prev[0] == contrato.gra_rep_ide
+                and prev[1] is not None
+            ):
+                prev = cache_pdfs.get(contrato.codigo_contrato)
             if (
                 prev is not None
                 and prev[0] is not None
@@ -233,6 +294,41 @@ class ContratoEnrichmentService:
                 if contrato.gra_rep_ide is not None and self._pdf_storage is not None:
                     pending_pdf_indices.append(idx)
 
+        # Paso 5-bis (jun 2026): si el documento tiene un contrato
+        # SELECCIONADO y esta entre los recuperados, limitamos la
+        # descarga de PDFs a ESE contrato. Los demas, si no se pudieron
+        # reutilizar, quedan sin PDF hasta que alguien los seleccione
+        # (se descargara entonces, en su propio re-fetch). Esto hace que
+        # cambiar de contrato en el combo cueste UNA descarga como
+        # maximo, en lugar de re-bajar todos los del proveedor+obra.
+        # Sin seleccion (pipeline automatico), comportamiento original.
+        selected_codigo: str | None = None
+        try:
+            selected_codigo = self._repository.get_selected_contrato_codigo(
+                document_id=merge_document_id,
+            )
+        except Exception:  # noqa: BLE001
+            selected_codigo = None
+        if selected_codigo and any(
+            c.codigo_contrato == selected_codigo
+            for c in contratos_with_maybe_reused
+        ):
+            before = len(pending_pdf_indices)
+            pending_pdf_indices = [
+                i
+                for i in pending_pdf_indices
+                if contratos_with_maybe_reused[i].codigo_contrato
+                == selected_codigo
+            ]
+            logger.info(
+                "%s Seleccion activa (%s): descarga de PDFs limitada "
+                "%s -> %s pendiente(s).",
+                _LOG_PREFIX,
+                selected_codigo,
+                before,
+                len(pending_pdf_indices),
+            )
+
         logger.info(
             "%s PDFs reutilizados=%s pendientes_descargar=%s",
             _LOG_PREFIX,
@@ -249,44 +345,6 @@ class ContratoEnrichmentService:
         except Exception:
             logger.exception("%s ERROR guardando contratos.", _LOG_PREFIX)
             return 0
-
-        # Paso 6-bis: sobrescribir el NOMBRE del proveedor de la CABECERA
-        # del albarán con la razón social canónica de Sigrid (``prv.raz``),
-        # que viaja en los contratos recién resueltos por CIF. Es el punto
-        # en que "accedemos a la info del proveedor por su CIF", así que es
-        # donde corregimos el nombre que la 1ª fase IA leyó del albarán
-        # (a menudo abreviado/mal escrito). Best-effort: si falla, NO rompe
-        # el enrichment (los contratos ya están guardados). Se protege con
-        # hasattr para no romper repos/mocks que no implementen el método.
-        nombre_canonico = next(
-            (
-                (c.nombre_proveedor or "").strip()
-                for c in contratos
-                if (c.nombre_proveedor or "").strip()
-            ),
-            "",
-        )
-        if nombre_canonico and hasattr(
-            self._repository, "update_merge_proveedor_nombre"
-        ):
-            try:
-                actualizado = self._repository.update_merge_proveedor_nombre(
-                    document_id=merge_document_id,
-                    nombre_proveedor=nombre_canonico,
-                )
-                if actualizado:
-                    logger.info(
-                        "%s proveedor_nombre de la cabecera sobrescrito con "
-                        "la razón social canónica de Sigrid: %r",
-                        _LOG_PREFIX,
-                        nombre_canonico,
-                    )
-            except Exception:
-                logger.exception(
-                    "%s No se pudo sobrescribir proveedor_nombre (no afecta "
-                    "al enrichment).",
-                    _LOG_PREFIX,
-                )
 
         # Paso 7: descargar + subir PDFs pendientes, y actualizar paths.
         #
@@ -357,11 +415,152 @@ class ContratoEnrichmentService:
             except Exception:
                 logger.exception("%s ERROR auto-seleccionando contrato.", _LOG_PREFIX)
 
+        # ------------------------------------------------------------ #
+        # Paso 9 (jun 2026) — GARANTÍA de PDF para el contrato
+        # seleccionado.
+        #
+        # De aquí en adelante: si tras todo el enrichment el contrato
+        # SELECCIONADO sigue sin PDF en BBDD pero tiene gra_rep_ide,
+        # forzamos UNA descarga de su PDF. Cubre los caminos en los que
+        # los pasos 5-7 no lo bajaron (p.ej. cache-hit con PDF NULL que
+        # no degradó a miss, o el contrato ya estaba en la fila pero sin
+        # path). Sin esto, sv5 no descarga el PDF (Fase 1B desaparece) y
+        # la línea base del hormigón se queda sin precio de contrato, y
+        # además el botón "Abrir contrato en SharePoint" no aparece.
+        #
+        # Best-effort y barato: una sola descarga, solo del seleccionado,
+        # solo si falta el PDF. El COALESCE del UPSERT garantiza que el
+        # path escrito aquí ya no volverá a NULL en futuros enriquecimientos.
+        # ------------------------------------------------------------ #
+        self._ensure_pdf_for_selected_contrato(
+            merge_document_id=merge_document_id,
+            contratos=contratos_with_maybe_reused,
+        )
+
         return len(contratos)
 
     # ------------------------------------------------------------------ #
     # Cache lookup helper
     # ------------------------------------------------------------------ #
+    def _canonize_proveedor_nombre_safely(
+        self,
+        *,
+        merge_document_id: str,
+        nombre_proveedor: str | None,
+    ) -> None:
+        """Sobrescribe ``proveedor_nombre`` de la cabecera con la razón
+        social canónica de Sigrid (``prv.raz``). Best-effort: cualquier
+        fallo se loguea y NO rompe el enrichment.
+
+        Tolerante a repositorios/mocks antiguos sin el método
+        (AttributeError → no-op).
+        """
+        nombre = (nombre_proveedor or "").strip()
+        if not nombre:
+            return
+        try:
+            updater = getattr(
+                self._repository, "update_merge_proveedor_nombre", None
+            )
+            if updater is None:
+                logger.info(
+                    "%s repo sin update_merge_proveedor_nombre; "
+                    "canonización omitida. doc=%s",
+                    _LOG_PREFIX,
+                    merge_document_id,
+                )
+                return
+            updater(
+                document_id=merge_document_id,
+                nombre_proveedor=nombre,
+            )
+        except Exception:
+            logger.exception(
+                "%s FALLO canonizando proveedor_nombre. doc=%s",
+                _LOG_PREFIX,
+                merge_document_id,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Garantía de PDF para el contrato seleccionado (jun 2026)
+    # ------------------------------------------------------------------ #
+    def _ensure_pdf_for_selected_contrato(
+        self,
+        *,
+        merge_document_id: str,
+        contratos: list[ContratoEnrichmentResult],
+    ) -> None:
+        """Si el contrato SELECCIONADO no tiene PDF en BBDD pero sí
+        ``gra_rep_ide``, fuerza una descarga + subida + UPDATE.
+
+        Best-effort: cualquier fallo se loguea y NO rompe el enrichment.
+        No-op si no hay pdf_storage, si no hay selección, si el contrato
+        seleccionado no está entre los recuperados, o si ya tiene PDF.
+        """
+        if self._pdf_storage is None:
+            return
+
+        try:
+            selected_codigo = self._repository.get_selected_contrato_codigo(
+                document_id=merge_document_id,
+            )
+        except Exception:  # noqa: BLE001
+            selected_codigo = None
+        if not selected_codigo:
+            return
+
+        # ¿Ya tiene PDF COMPLETO en BBDD? Necesitamos AMBOS:
+        #   - relative_path → para que sv5 pueda descargar el PDF.
+        #   - web_url       → para que el portal muestre el botón
+        #                     "Abrir contrato en SharePoint".
+        # La caché puede tener relative_path pero web_url=None (su filtro
+        # solo exige relative_path). Si reutilizamos esa fila, el merge
+        # se queda sin web_url y el botón no aparece aunque la valoración
+        # funcione. Por eso re-descargamos si falta CUALQUIERA de los dos.
+        try:
+            existing = self._repository.get_existing_pdf_paths(
+                document_id=merge_document_id,
+            )
+        except Exception:  # noqa: BLE001
+            existing = {}
+        prev = existing.get(selected_codigo)
+        if prev is not None and prev[1] and prev[2]:
+            # prev = (gra_rep_ide, relative_path, web_url) — completo.
+            return
+
+        # Buscamos el DTO del contrato seleccionado para tener su
+        # gra_rep_ide (necesario para descargar de Sigrid).
+        target = next(
+            (c for c in contratos if c.codigo_contrato == selected_codigo),
+            None,
+        )
+        if target is None or target.gra_rep_ide is None:
+            logger.info(
+                "%s Paso 9: contrato seleccionado %s sin gra_rep_ide o no "
+                "recuperado; no se puede garantizar PDF. doc=%s",
+                _LOG_PREFIX, selected_codigo, merge_document_id,
+            )
+            return
+
+        logger.info(
+            "%s Paso 9: contrato seleccionado %s con PDF incompleto "
+            "(rel=%s web_url=%s); forzando descarga (gra_rep_ide=%s). doc=%s",
+            _LOG_PREFIX, selected_codigo,
+            bool(prev[1]) if prev else False,
+            bool(prev[2]) if prev else False,
+            target.gra_rep_ide, merge_document_id,
+        )
+        rel_path, web_url = self._download_and_store_pdf(
+            document_id=merge_document_id,
+            contrato=target,
+        )
+        if rel_path is None and web_url is None:
+            logger.warning(
+                "%s Paso 9: no se pudo garantizar el PDF del contrato %s. "
+                "doc=%s",
+                _LOG_PREFIX, selected_codigo, merge_document_id,
+            )
+
     def _try_cache_hit(
         self,
         *,
@@ -431,6 +630,33 @@ class ContratoEnrichmentService:
                 codigo_obra,
                 cif_proveedor,
                 fecha_int,
+                merge_document_id,
+            )
+            return None
+
+        # Reparación de caché incompleta (jun 2026): si el contrato
+        # cacheado NO tiene PDF en SharePoint y tenemos pdf_storage,
+        # degradamos el hit a MISS para que el flujo siga a Sigrid,
+        # aplique la selección de documentos vigente (Words combinados /
+        # PDF sin audit-trail), suba el PDF y reescriba la caché ya
+        # completa. Sin esto, una caché escrita cuando el PDF fallaba
+        # (o cuando el criterio antiguo ignoraba los contratos cuyo
+        # único documento es Word) propagaba "sin PDF" a TODOS los
+        # albaranes futuros del mismo proveedor+obra, y la valoración
+        # corría sin contrato (Fase 1B imposible).
+        if (
+            cached.pdf_sharepoint_relative_path is None
+            and self._pdf_storage is not None
+        ):
+            logger.info(
+                "%s CACHE HIT INCOMPLETO (sin PDF) obra=%s cif=%s "
+                "codigo=%s gra_rep_ide=%s -> se trata como MISS para "
+                "regenerar el PDF desde Sigrid. doc=%s",
+                _LOG_PREFIX,
+                codigo_obra,
+                cif_proveedor,
+                cached.codigo_contrato,
+                cached.gra_rep_ide,
                 merge_document_id,
             )
             return None

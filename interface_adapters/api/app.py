@@ -49,6 +49,10 @@ from application.services.contrato_enrichment_service import (
 from application.services.contrato_refetch_service import (
     ContratoRefetchService,
 )
+from application.services.header_grounding_service import (
+    HeaderGroundingRequest,
+    HeaderGroundingService,
+)
 from application.services.header_resolver_service import HeaderResolverService
 from application.services.obra_enrichment_service import ObraEnrichmentService
 from application.services.phase2_persistence_service import (
@@ -125,6 +129,7 @@ def build_app(settings: Settings) -> FastAPI:
     obra_enrichment_service: ObraEnrichmentService | None = None
     contrato_enrichment_service: ContratoEnrichmentService | None = None
     contrato_refetch_service: ContratoRefetchService | None = None
+    header_grounding_service: HeaderGroundingService | None = None
 
     if settings.sigrid_credentials_present:
         sigrid_obra_client = SigridApiObraClient(
@@ -171,10 +176,34 @@ def build_app(settings: Settings) -> FastAPI:
         # portal". Reutiliza el enrichment con force_refetch=True y
         # devuelve un outcome rico (status/message/...) para que el
         # front pinte feedback.
+        #
+        # jun 2026: ahora recibe TAMBIÉN el obra_enrichment (refresca
+        # nombre + dirección de la obra al pulsar "Volver a buscar")
+        # y el cliente de contratos como proveedor_lookup (canoniza
+        # proveedor_nombre por CIF aunque no haya contratos). Antes el
+        # refetch SOLO buscaba contratos y los datos de cabecera nunca
+        # se actualizaban desde el portal (bug reportado).
         # ---------------------------------------------------------------- #
         contrato_refetch_service = ContratoRefetchService(
             enrichment=contrato_enrichment_service,
             repository=repository,
+            obra_enrichment=obra_enrichment_service,
+            proveedor_client=sigrid_contrato_client,
+        )
+
+        # ---------------------------------------------------------------- #
+        # HeaderGroundingService (jun 2026) — validación determinista de
+        # la cabecera de fase 1 para la 2ª IA (consumido por sv7 vía
+        # POST /v1/sigrid/header-grounding).
+        # ---------------------------------------------------------------- #
+        header_grounding_service = HeaderGroundingService(
+            obra_client=sigrid_obra_client,
+            proveedor_client=sigrid_contrato_client,
+            max_obras_candidatas=settings.grounding_max_obras_candidatas,
+            max_proveedores_candidatos=(
+                settings.grounding_max_proveedores_candidatos
+            ),
+            enabled=settings.header_grounding_enabled,
         )
 
         logger.info(
@@ -406,5 +435,42 @@ def build_app(settings: Settings) -> FastAPI:
             outcome.selected_contrato_codigo,
         )
         return asdict(outcome)
+
+    # ---------------------------------------------------------------- #
+    # Grounding de cabecera para la 2ª IA (jun 2026).
+    #
+    # Consumido por el orquestador (sv7) ANTES de llamar a sv2 fase 2:
+    #   - Valida el CIF leído por la 1ª IA contra el maestro ``prv``
+    #     (determinista). Si existe → proveedor VALIDADO + razón social
+    #     canónica; la IA no debe tocarlo.
+    #   - Valida el código de obra contra Sigrid. Si existe → obra
+    #     VALIDADA con nombre + dirección canónicos.
+    #   - Para lo NO validado adjunta candidatos (obras activas;
+    #     proveedores con contrato en la obra) para que la 2ª IA case
+    #     el texto leído con la entidad real del ERP.
+    #
+    # Respuestas:
+    #   * 200 + bloque grounding (siempre, aunque todo sea 'skipped').
+    #   * 503 si Sigrid no está cableado en este sv3.
+    # ---------------------------------------------------------------- #
+    @app.post("/v1/sigrid/header-grounding")
+    def header_grounding(body: Dict[str, Any]) -> Dict[str, Any]:
+        if header_grounding_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Grounding no disponible: Sigrid no está cableado "
+                    "en el sv3 (faltan SIGRID_API_* en .env)."
+                ),
+            )
+        request = HeaderGroundingRequest(
+            proveedor_cif=(body or {}).get("proveedor_cif"),
+            proveedor_nombre=(body or {}).get("proveedor_nombre"),
+            obra_codigo=(body or {}).get("obra_codigo"),
+            obra_nombre=(body or {}).get("obra_nombre"),
+            obra_direccion=(body or {}).get("obra_direccion"),
+        )
+        response = header_grounding_service.ground(request)
+        return asdict(response)
 
     return app

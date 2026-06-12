@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import OrderedDict
 from typing import Any
 
@@ -13,6 +14,9 @@ from domain.models.contrato_models import (
     ContratoLineFromSigrid,
 )
 from domain.ports.contrato_enrichment_port import ContratoPdfPayload
+from infrastructure.documents import docx_pdf_renderer as docx_renderer
+from infrastructure.documents.simple_pdf_writer import build_text_pdf
+from infrastructure.documents.word_text_extractor import extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +96,70 @@ SELECT
     rcg.pos             AS rcg_pos,
     gra.cod             AS gra_cod,
     gra.nom             AS gra_nom,
-    gra.nomori          AS gra_nomori
+    gra.nomori          AS gra_nomori,
+    gra.fec             AS gra_fec
 FROM rcg
 JOIN gra ON rcg.gra = gra.ide
 WHERE rcg.con = ?
 ORDER BY rcg.pos
 """
+
+# Nombres de PDF que NO son el contrato (certificados de firma y
+# evidencias de Signaturit y similares).
+_AUDIT_NAME_RX = re.compile(r"audit|trail", re.IGNORECASE)
+
+_WORD_EXTS = (".doc", ".docx")
+
+
+def _select_contract_docs(
+    docs: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Selecciona los documentos que componen el contrato.
+
+    ``docs``: dicts con claves ``cod``, ``name``, ``fec`` (entero
+    YYYYMMDD, 0 = sin fecha) y ``pos``.
+
+    Regla (jun 2026, acordada con el cliente tras analizar casos reales
+    donde se descargaba el audit-trail de Signaturit en lugar del
+    contrato). Los nombres con audit/trail se excluyen SIEMPRE:
+
+    1. Si hay documentos Word (.doc/.docx): se cogen TODOS, ordenados
+       del más antiguo al más moderno (fecha, desempate por posición).
+       Son los documentos "fuente" del contrato (original + ampliaciones)
+       y se combinarán (texto extraído) en un único PDF.
+       → ("words", [todos los word ordenados])
+    2. Si NO hay Word: se cogen TODOS los PDF (sin audit/trail),
+       ordenados del más antiguo al más moderno, y se FUSIONARÁN
+       página a página en un único PDF (formato original intacto).
+       → ("pdfs", [todos los pdf ordenados])
+    3. Si no queda nada (p.e. solo audit-trails): → ("none", []).
+    """
+
+    def sort_key(d: dict[str, Any]) -> tuple[int, int]:
+        fec = d.get("fec") or 0
+        # Sin fecha (0) al final; el resto ascendente (más antiguo antes).
+        return (fec if fec > 0 else 99999999, d.get("pos") or 0)
+
+    def is_audit(d: dict[str, Any]) -> bool:
+        return bool(_AUDIT_NAME_RX.search(str(d.get("name") or "")))
+
+    words = [
+        d for d in docs
+        if str(d.get("name") or "").lower().endswith(_WORD_EXTS)
+        and not is_audit(d)
+    ]
+    if words:
+        return "words", sorted(words, key=sort_key)
+
+    pdfs = [
+        d for d in docs
+        if str(d.get("name") or "").lower().endswith(".pdf")
+        and not is_audit(d)
+    ]
+    if pdfs:
+        return "pdfs", sorted(pdfs, key=sort_key)
+
+    return "none", []
 
 _SQL_GRA_REP_BY_COD = """\
 SELECT
@@ -133,6 +195,13 @@ class SigridApiContratoClient:
         self._function_key = function_key
         self._database = database
         self._database_rep = database_rep
+        # Plan de descarga/combinación por gra_rep_ide "principal" (jun
+        # 2026): cuando la selección de documentos del contrato implica
+        # VARIOS Word a combinar, _fetch_gra_rep_ide guarda aquí la lista
+        # completa y download_contrato_pdf la consume. Si un ide no está
+        # (p.e. proceso reiniciado y reuso desde contratos_cache), la
+        # descarga cae al comportamiento clásico de un solo documento.
+        self._combine_plan_by_primary: dict[int, dict[str, Any]] = {}
         self._timeout_s = float(timeout_s)
         self._max_rows = int(max_rows)
         self._pdf_timeout_s = float(pdf_timeout_s)
@@ -224,16 +293,258 @@ class SigridApiContratoClient:
         *,
         gra_rep_ide: int,
     ) -> ContratoPdfPayload | None:
-        """Descarga el PDF desde ``ruesma_rep.gra`` vía /api/documents/read.
+        """Devuelve el PDF del contrato (jun 2026).
+
+        - Si ``gra_rep_ide`` tiene un plan de combinación registrado por
+          :meth:`_fetch_gra_rep_ide` (hay documentos Word: original +
+          ampliaciones), descarga TODOS, extrae su texto y los combina
+          (del más antiguo al más moderno) en un ÚNICO PDF generado.
+        - En cualquier otro caso (PDF único elegido, o reuso desde caché
+          sin plan en memoria) descarga ese documento tal cual, como
+          siempre.
+        """
+        plan = self._combine_plan_by_primary.get(int(gra_rep_ide))
+        if plan and plan.get("kind") == "words":
+            return self._download_and_combine_words(
+                primary_ide=int(gra_rep_ide), docs=plan["docs"]
+            )
+        if plan and plan.get("kind") == "pdfs":
+            return self._download_and_merge_pdfs(
+                primary_ide=int(gra_rep_ide), docs=plan["docs"]
+            )
+
+        raw = self._download_document_raw(gra_rep_ide=gra_rep_ide)
+        if raw is None:
+            return None
+        filename, content, content_type = raw
+        return ContratoPdfPayload(
+            filename=filename or f"contrato_{gra_rep_ide}.pdf",
+            content=content,
+            content_type=content_type,
+        )
+
+    def _download_and_merge_pdfs(
+        self,
+        *,
+        primary_ide: int,
+        docs: list[dict[str, Any]],
+    ) -> ContratoPdfPayload | None:
+        """Descarga los PDFs del plan y los FUSIONA página a página.
+
+        El orden de ``docs`` ya viene del más antiguo al más moderno.
+        Las páginas originales se conservan intactas (tablas de precios
+        incluidas), sin conversión intermedia. Si la fusión no es
+        posible (pypdf ausente, PDFs ilegibles), degrada al PDF más
+        antiguo descargable, que era el comportamiento anterior.
+        """
+        from infrastructure.documents.pdf_merger import merge_pdfs
+
+        blobs: list[bytes] = []
+        first_payload: ContratoPdfPayload | None = None
+        for doc in docs:
+            rep_ide = int(doc["rep_ide"])
+            try:
+                raw = self._download_document_raw(gra_rep_ide=rep_ide)
+            except Exception:
+                logger.exception(
+                    "%s MERGE: fallo descargando pdf rep_ide=%s",
+                    _LOG_PREFIX,
+                    rep_ide,
+                )
+                continue
+            if raw is None:
+                logger.warning(
+                    "%s MERGE: pdf rep_ide=%s sin contenido.",
+                    _LOG_PREFIX,
+                    rep_ide,
+                )
+                continue
+            filename, content, content_type = raw
+            blobs.append(content)
+            if first_payload is None:
+                first_payload = ContratoPdfPayload(
+                    filename=filename or f"contrato_{rep_ide}.pdf",
+                    content=content,
+                    content_type=content_type,
+                )
+
+        if not blobs:
+            logger.warning(
+                "%s MERGE: ningún pdf descargable para primary=%s.",
+                _LOG_PREFIX,
+                primary_ide,
+            )
+            return None
+
+        if len(blobs) == 1:
+            return first_payload
+
+        merged = merge_pdfs(blobs)
+        if merged is None:
+            logger.warning(
+                "%s MERGE: fusión no disponible; se usa el PDF más "
+                "antiguo (primary=%s).",
+                _LOG_PREFIX,
+                primary_ide,
+            )
+            return first_payload
+
+        base = str(docs[0].get("name") or f"contrato_{primary_ide}")
+        stem = base.rsplit(".", 1)[0]
+        filename = f"{stem}_COMBINADO.pdf"
+        logger.info(
+            "%s MERGE: %s pdf(s) → %s (%s bytes)",
+            _LOG_PREFIX,
+            len(blobs),
+            filename,
+            len(merged),
+        )
+        return ContratoPdfPayload(
+            filename=filename,
+            content=merged,
+            content_type="application/pdf",
+        )
+
+    def _download_and_combine_words(
+        self,
+        *,
+        primary_ide: int,
+        docs: list[dict[str, Any]],
+    ) -> ContratoPdfPayload | None:
+        """Descarga los Word del plan y los combina en UN PDF.
+
+        Estrategia (jun 2026):
+          - Vía PREFERENTE: renderizar cada ``.docx`` a HTML con mammoth
+            (conserva encabezados, párrafos, listas y TABLAS de tarifas)
+            y combinar todo a un PDF con xhtml2pdf. Así el LLM de sv5
+            recibe las tablas de precios como tablas reales, no como
+            texto aplanado con `` | ``.
+          - Vía FALLBACK (si el renderer no está disponible, el archivo
+            es ``.doc`` binario, o el render falla): el método antiguo de
+            extraer texto plano y volcarlo a un PDF de texto
+            (``build_text_pdf``). Nunca rompe el flujo.
+
+        El orden de ``docs`` ya viene del más antiguo al más moderno.
+        Si algún Word falla se continúa con los demás (mejor un contrato
+        parcial que el audit-trail); si fallan todos, None.
+        """
+        use_renderer = docx_renderer.renderer_available()
+
+        # Por cada documento guardamos su título y AMBAS representaciones:
+        #   - html: fragmento estructurado (solo .docx vía mammoth)
+        #   - texto: texto plano (siempre, como fallback)
+        # Así, si al final el render falla, tenemos el texto listo sin
+        # re-descargar.
+        html_sections: list[tuple[str, str]] = []
+        text_sections: list[tuple[str, str]] = []
+        any_html = False
+
+        for doc in docs:
+            rep_ide = int(doc["rep_ide"])
+            try:
+                raw = self._download_document_raw(gra_rep_ide=rep_ide)
+            except Exception:
+                logger.exception(
+                    "%s COMBINE: fallo descargando word rep_ide=%s",
+                    _LOG_PREFIX,
+                    rep_ide,
+                )
+                continue
+            if raw is None:
+                logger.warning(
+                    "%s COMBINE: word rep_ide=%s sin contenido.",
+                    _LOG_PREFIX,
+                    rep_ide,
+                )
+                continue
+            filename, content, _ctype = raw
+            fec = doc.get("fec") or 0
+            fec_str = (
+                f"{str(fec)[6:8]}/{str(fec)[4:6]}/{str(fec)[0:4]}"
+                if fec
+                else "sin fecha"
+            )
+            titulo = f"DOCUMENTO: {doc.get('name') or filename} ({fec_str})"
+
+            # Texto plano (siempre disponible como fallback).
+            texto = extract_text(filename, content)
+            if not texto:
+                texto = "(no se pudo extraer texto de este documento)"
+            text_sections.append((titulo, texto))
+
+            # HTML estructurado (solo .docx y solo si el renderer existe).
+            html_frag: str | None = None
+            is_docx = (filename or "").lower().endswith(".docx")
+            if use_renderer and is_docx:
+                html_frag = docx_renderer.docx_to_html_fragment(content)
+            if html_frag:
+                any_html = True
+                html_sections.append((titulo, html_frag))
+            else:
+                # .doc binario o fallo de mammoth: incrustamos su texto
+                # como bloque <pre> para no perderlo en el PDF combinado.
+                html_sections.append(
+                    (titulo, docx_renderer.text_to_html_fragment(texto))
+                )
+
+        if not text_sections:
+            logger.warning(
+                "%s COMBINE: ningún word descargable para primary=%s.",
+                _LOG_PREFIX,
+                primary_ide,
+            )
+            return None
+
+        base = str(docs[0].get("name") or f"contrato_{primary_ide}")
+        stem = base.rsplit(".", 1)[0]
+        filename = f"{stem}_COMBINADO.pdf"
+
+        # Vía preferente: PDF renderizado con estructura.
+        pdf_bytes: bytes | None = None
+        if use_renderer and any_html:
+            pdf_bytes = docx_renderer.combine_html_to_pdf(html_sections)
+            if pdf_bytes:
+                logger.info(
+                    "%s COMBINE (render): %s sección(es) → %s (%s bytes), "
+                    "tablas conservadas.",
+                    _LOG_PREFIX,
+                    len(html_sections),
+                    filename,
+                    len(pdf_bytes),
+                )
+
+        # Fallback: PDF de texto plano (método antiguo).
+        if not pdf_bytes:
+            pdf_bytes = build_text_pdf(text_sections)
+            logger.info(
+                "%s COMBINE (texto/fallback): %s sección(es) → %s (%s bytes).",
+                _LOG_PREFIX,
+                len(text_sections),
+                filename,
+                len(pdf_bytes),
+            )
+
+        return ContratoPdfPayload(
+            filename=filename,
+            content=pdf_bytes,
+            content_type="application/pdf",
+        )
+
+    def _download_document_raw(
+        self,
+        *,
+        gra_rep_ide: int,
+    ) -> tuple[str, bytes, str | None] | None:
+        """Descarga un documento desde ``ruesma_rep.gra`` vía
+        /api/documents/read.
 
         La respuesta es binaria (no JSON). El nombre de fichero viene
         en el header ``X-Document-Filename`` (si el endpoint lo envía;
-        en la Function App actual sí lo hace). Content-Type típico
-        ``application/pdf``.
+        en la Function App actual sí lo hace).
 
         Devuelve ``None`` si:
           - El endpoint responde con body vacío.
-          - El ide no existe (404) — se interpreta como "no hay PDF".
+          - El ide no existe (404) — se interpreta como "no hay documento".
 
         Lanza ``RuntimeError`` si hay un error de transporte o 5xx —
         el orquestador decide si continuar con otros contratos o abortar.
@@ -298,12 +609,8 @@ class SigridApiContratoClient:
         if not content:
             return None
 
-        filename = filename_header.strip() or f"contrato_{gra_rep_ide}.pdf"
-        return ContratoPdfPayload(
-            filename=filename,
-            content=content,
-            content_type=content_type,
-        )
+        filename = filename_header.strip() or f"documento_{gra_rep_ide}"
+        return filename, content, content_type
 
     # --------------------------------------------------------------- #
     # HTTP primitive para queries SQL
@@ -317,13 +624,16 @@ class SigridApiContratoClient:
         empresa Ruesma (emp=1), para que el HeaderResolverService deduzca
         el CIF por nombre cuando la IA no lo fijo. Best-effort.
 
-        ``ctr.entres`` es nvarchar -> DISTINCT es valido aqui.
+        jun 2026: el nombre es ahora la razon social CANONICA del
+        maestro de proveedores (``prv.raz``), no el snapshot
+        desnormalizado ``ctr.entres`` que arrastraba nombres antiguos.
         """
         sql = (
-            "SELECT DISTINCT ctr.entcif AS cif, ctr.entres AS nombre "
+            "SELECT DISTINCT prv.cif AS cif, prv.raz AS nombre "
             "FROM ctr "
             "JOIN con ON ctr.ide = con.ide "
-            "WHERE ctr.entcif IS NOT NULL AND con.emp = 1"
+            "JOIN prv ON ctr.entide = prv.ide "
+            "WHERE prv.cif IS NOT NULL AND con.emp = 1"
         )
         columns, rows = self._post_sql_read(
             sql=sql,
@@ -338,6 +648,150 @@ class SigridApiContratoClient:
             nombre = _opt_str(row_map.get("nombre"))
             if cif:
                 out.append((cif, nombre))
+        return out
+
+    def fetch_proveedor_by_cif(
+        self,
+        *,
+        cif: str,
+    ) -> tuple[str, str | None] | None:
+        """Lookup DETERMINISTA por CIF exacto en el maestro ``prv``.
+
+        Normaliza el CIF (mayusculas, sin espacios) en AMBOS lados de la
+        comparacion para tolerar variantes tipo "B 12345678".
+
+        Returns
+        -------
+        tuple[str, str | None] | None
+            ``(cif_canonico, razon_social_canonica)`` si el CIF existe
+            en Sigrid; ``None`` si no existe. La razon social es
+            ``prv.raz`` (fuente de verdad del maestro de proveedores).
+
+        Uso (jun 2026):
+          - Grounding de fase 2 (sv7→sv3): si el CIF leido por la 1a IA
+            existe, el proveedor queda VALIDADO y NO pasa a revision IA.
+          - Refetch del portal (sv4): al confirmar un proveedor que
+            existe, su nombre se sobrescribe con el canonico aunque
+            Sigrid no devuelva contratos para esa obra.
+        """
+        cif_clean = (cif or "").strip().upper().replace(" ", "")
+        if not cif_clean:
+            return None
+        sql = (
+            "SELECT TOP 1 prv.cif AS cif, prv.raz AS nombre "
+            "FROM prv "
+            "WHERE REPLACE(UPPER(prv.cif), ' ', '') = ?"
+        )
+        columns, rows = self._post_sql_read(
+            sql=sql,
+            parameters=[cif_clean],
+            database=self._database,
+            label="fetch_proveedor_by_cif",
+        )
+        if not rows:
+            logger.info(
+                "%s fetch_proveedor_by_cif: CIF %s NO existe en prv.",
+                _LOG_PREFIX,
+                cif_clean,
+            )
+            return None
+        row_map = dict(zip(columns, rows[0]))
+        cif_canon = _opt_str(row_map.get("cif")) or cif_clean
+        nombre = _opt_str(row_map.get("nombre"))
+        logger.info(
+            "%s fetch_proveedor_by_cif: CIF %s VALIDADO -> %r",
+            _LOG_PREFIX,
+            cif_clean,
+            nombre,
+        )
+        return cif_canon, nombre
+
+    def fetch_proveedores_por_obra(
+        self,
+        *,
+        codigo_obra: str,
+    ) -> list[tuple[str | None, str | None]]:
+        """Proveedores (cif, razon social canonica) con contrato en una
+        obra concreta. emp=1 (Construcciones Ruesma).
+
+        Usado por el HeaderGroundingService como lista de candidatos
+        para la IA de fase 2 cuando el CIF leido no valida pero la obra
+        si: el conjunto es corto y de maxima relevancia.
+        """
+        codigo = (codigo_obra or "").strip()
+        if not codigo:
+            return []
+        sql = (
+            "SELECT DISTINCT prv.cif AS cif, prv.raz AS nombre "
+            "FROM ctr "
+            "JOIN con AS con_ctr ON ctr.ide    = con_ctr.ide "
+            "JOIN con AS con_obr ON ctr.obride = con_obr.ide "
+            "JOIN prv            ON ctr.entide = prv.ide "
+            "WHERE con_obr.cod = ? "
+            "  AND con_ctr.emp = 1"
+        )
+        columns, rows = self._post_sql_read(
+            sql=sql,
+            parameters=[codigo],
+            database=self._database,
+            label=f"proveedores_por_obra_{codigo}",
+        )
+        out: list[tuple[str | None, str | None]] = []
+        seen: set[str] = set()
+        for row in rows:
+            row_map = dict(zip(columns, row))
+            cif = _opt_str(row_map.get("cif"))
+            if not cif or cif in seen:
+                continue
+            seen.add(cif)
+            out.append((cif, _opt_str(row_map.get("nombre"))))
+        return out
+
+    def fetch_proveedores_por_obra(
+        self,
+        *,
+        codigo_obra: str,
+    ) -> list[tuple[str | None, str | None]]:
+        """Proveedores con contrato en una obra (emp=1), con razon
+        social CANONICA (``prv.raz``).
+
+        Usado por el HeaderGroundingService como lista de candidatos
+        para que la 2ª IA case el nombre leido cuando el CIF no valido.
+        Devuelve tuplas ``(cif, nombre)`` deduplicadas por CIF.
+        """
+        codigo = (codigo_obra or "").strip()
+        if not codigo:
+            return []
+        sql = (
+            "SELECT DISTINCT prv.cif AS cif, prv.raz AS nombre "
+            "FROM ctr "
+            "JOIN con AS con_ctr ON ctr.ide    = con_ctr.ide "
+            "JOIN con AS con_obr ON ctr.obride = con_obr.ide "
+            "JOIN prv            ON ctr.entide = prv.ide "
+            "WHERE con_obr.cod = ? "
+            "  AND con_ctr.emp = 1"
+        )
+        columns, rows = self._post_sql_read(
+            sql=sql,
+            parameters=[codigo],
+            database=self._database,
+            label=f"proveedores_obra_{codigo}",
+        )
+        seen: set[str] = set()
+        out: list[tuple[str | None, str | None]] = []
+        for row in rows:
+            row_map = dict(zip(columns, row))
+            cif = _opt_str(row_map.get("cif"))
+            if not cif or cif in seen:
+                continue
+            seen.add(cif)
+            out.append((cif, _opt_str(row_map.get("nombre"))))
+        logger.info(
+            "%s proveedores_por_obra obra=%s -> %s proveedores",
+            _LOG_PREFIX,
+            codigo,
+            len(out),
+        )
         return out
 
     def _post_sql_read(
@@ -496,6 +950,15 @@ class SigridApiContratoClient:
             return None
 
     def _fetch_gra_rep_ide(self, *, contrato_ide: int) -> int | None:
+        """Selecciona y resuelve los documentos del contrato (jun 2026).
+
+        Aplica :func:`_select_contract_docs` sobre los documentos
+        relacionados (rcg→gra) y resuelve cada uno en ``ruesma_rep``.
+        Devuelve el ``gra_rep_ide`` PRINCIPAL (el Word más antiguo o el
+        PDF elegido) y, si hay varios Word, registra el plan completo en
+        ``self._combine_plan_by_primary`` para que
+        :meth:`download_contrato_pdf` los combine en un único PDF.
+        """
         cols, rows = self._post_sql_read(
             sql=_SQL_GRA_COD_BY_CONTRATO,
             parameters=[contrato_ide],
@@ -503,7 +966,7 @@ class SigridApiContratoClient:
             label=f"rcg_gra_for_ctr_{contrato_ide}",
         )
 
-        pdf_cods: list[str] = []
+        docs: list[dict[str, Any]] = []
         for row in rows:
             row_map = dict(zip(cols, row))
             cod = _opt_str(row_map.get("gra_cod"))
@@ -514,32 +977,80 @@ class SigridApiContratoClient:
                 or _opt_str(row_map.get("gra_nom"))
                 or ""
             )
-            if name.lower().endswith(".pdf"):
-                pdf_cods.append(cod)
+            docs.append(
+                {
+                    "cod": cod,
+                    "name": name,
+                    "fec": _opt_int(row_map.get("gra_fec")) or 0,
+                    "pos": _opt_int(row_map.get("rcg_pos")) or 0,
+                }
+            )
 
-        if not pdf_cods:
+        kind, selected = _select_contract_docs(docs)
+        logger.info(
+            "%s contrato_ide=%s selección documentos: kind=%s -> %s",
+            _LOG_PREFIX,
+            contrato_ide,
+            kind,
+            [d["name"] for d in selected],
+        )
+        if not selected:
+            logger.warning(
+                "%s contrato_ide=%s SIN documento de contrato válido "
+                "(docs=%s). No se descargará PDF.",
+                _LOG_PREFIX,
+                contrato_ide,
+                [d["name"] for d in docs],
+            )
             return None
 
-        for cod in pdf_cods:
-            cols_rep, rows_rep = self._post_sql_read(
-                sql=_SQL_GRA_REP_BY_COD,
-                parameters=[cod],
-                database=self._database_rep,
-                label=f"gra_rep_for_cod_{cod}",
-            )
-            for row in rows_rep:
-                row_map = dict(zip(cols_rep, row))
-                gra_rep_ide = _opt_int(row_map.get("gra_rep_ide"))
-                if gra_rep_ide is not None:
-                    logger.info(
-                        "%s contrato_ide=%s → gra_rep_ide=%s (cod=%s)",
-                        _LOG_PREFIX,
-                        contrato_ide,
-                        gra_rep_ide,
-                        cod,
-                    )
-                    return gra_rep_ide
+        # Resolver cada cod en ruesma_rep (donde vive el binario).
+        resolved: list[dict[str, Any]] = []
+        for doc in selected:
+            rep_ide = self._resolve_rep_ide(cod=doc["cod"])
+            if rep_ide is None:
+                logger.warning(
+                    "%s contrato_ide=%s doc %r (cod=%s) sin fila en rep.",
+                    _LOG_PREFIX,
+                    contrato_ide,
+                    doc["name"],
+                    doc["cod"],
+                )
+                continue
+            resolved.append({**doc, "rep_ide": rep_ide})
 
+        if not resolved:
+            return None
+
+        primary = int(resolved[0]["rep_ide"])
+        if kind == "words" or (kind == "pdfs" and len(resolved) > 1):
+            self._combine_plan_by_primary[primary] = {
+                "kind": kind,
+                "docs": resolved,
+            }
+        logger.info(
+            "%s contrato_ide=%s → gra_rep_ide=%s (kind=%s, %s doc/s)",
+            _LOG_PREFIX,
+            contrato_ide,
+            primary,
+            kind,
+            len(resolved),
+        )
+        return primary
+
+    def _resolve_rep_ide(self, *, cod: str) -> int | None:
+        """Resuelve un ``gra.cod`` de ruesma en su ide de ruesma_rep."""
+        cols_rep, rows_rep = self._post_sql_read(
+            sql=_SQL_GRA_REP_BY_COD,
+            parameters=[cod],
+            database=self._database_rep,
+            label=f"gra_rep_for_cod_{cod}",
+        )
+        for row in rows_rep:
+            row_map = dict(zip(cols_rep, row))
+            gra_rep_ide = _opt_int(row_map.get("gra_rep_ide"))
+            if gra_rep_ide is not None:
+                return gra_rep_ide
         return None
 
 

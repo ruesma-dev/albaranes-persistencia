@@ -50,6 +50,29 @@ class ContratoCachePort(Protocol):
         """
         ...
 
+    def get_pdf_paths_for_codigos(
+        self,
+        *,
+        codigo_obra: str,
+        cif_proveedor: str,
+        codigos: list[str],
+    ) -> dict[str, tuple[int | None, str | None, str | None]]:
+        """Paths de PDF ya subidos a SharePoint para esos contratos.
+
+        Busca en la caché global por (obra, cif) las filas cuyos
+        ``codigo_contrato`` estén en ``codigos`` y tengan
+        ``pdf_sharepoint_relative_path`` no nulo. Si hay varias
+        versiones del mismo código, gana la de mayor
+        ``fecha_alta_contrato``.
+
+        Devuelve ``{codigo_contrato: (gra_rep_ide, relative_path,
+        web_url)}`` solo con los códigos encontrados. Permite REUTILIZAR
+        el PDF de un contrato ya descargado en el pasado (incluso por
+        otro albarán o tras cambiar de contrato y volver) sin repetir
+        la descarga de Sigrid ni la subida a SharePoint.
+        """
+        ...
+
     def upsert_contratos(
         self,
         *,

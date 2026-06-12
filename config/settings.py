@@ -136,6 +136,27 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------ #
+    # Grounding de cabecera para la fase 2 (jun 2026).
+    #
+    # Endpoint POST /v1/sigrid/header-grounding consumido por sv7
+    # ANTES de la 2ª IA: validación determinista por CIF (proveedor)
+    # y por código (obra) + listas de candidatos para lo no validado.
+    # Los topes limitan el tamaño del prompt de fase 2.
+    # ------------------------------------------------------------ #
+    header_grounding_enabled: bool = Field(
+        True,
+        alias="HEADER_GROUNDING_ENABLED",
+    )
+    grounding_max_obras_candidatas: int = Field(
+        300,
+        alias="GROUNDING_MAX_OBRAS_CANDIDATAS",
+    )
+    grounding_max_proveedores_candidatos: int = Field(
+        200,
+        alias="GROUNDING_MAX_PROVEEDORES_CANDIDATOS",
+    )
+
+    # ------------------------------------------------------------ #
     # Valuation trigger (sv6).
     #
     # IMPORTANTE: cuando el orquestador (sv7) está en producción,

@@ -119,6 +119,74 @@ class SqlAlchemyContratoCacheRepository:
 
             return self._orm_to_dto(chosen)
 
+    def get_pdf_paths_for_codigos(
+        self,
+        *,
+        codigo_obra: str,
+        cif_proveedor: str,
+        codigos: list[str],
+    ) -> dict[str, tuple[int | None, str | None, str | None]]:
+        """Paths de PDF ya subidos para esos codigos (ver puerto).
+
+        Reutilizacion de PDFs entre albaranes y tras cambios de
+        seleccion (jun 2026): si el contrato ya tiene su PDF en
+        SharePoint segun la cache global, no hay que volver a
+        descargarlo de Sigrid ni re-subirlo.
+        """
+        if not codigos:
+            return {}
+        with self._session_factory.create_session() as session:
+            stmt = (
+                select(
+                    ContratoCacheOrm.codigo_contrato,
+                    ContratoCacheOrm.gra_rep_ide,
+                    ContratoCacheOrm.pdf_sharepoint_relative_path,
+                    ContratoCacheOrm.pdf_sharepoint_web_url,
+                )
+                .where(
+                    and_(
+                        ContratoCacheOrm.codigo_obra == codigo_obra,
+                        ContratoCacheOrm.cif_proveedor == cif_proveedor,
+                        ContratoCacheOrm.codigo_contrato.in_(codigos),
+                        ContratoCacheOrm.pdf_sharepoint_relative_path.is_not(
+                            None
+                        ),
+                        # jun 2026: exigimos TAMBIÉN web_url. Si la caché
+                        # tiene relative_path pero web_url=None, reutilizarla
+                        # deja el merge sin web_url y el botón "Abrir
+                        # contrato en SharePoint" no aparece. Mejor tratar
+                        # esa fila como SIN PDF y forzar re-descarga (que
+                        # rellena ambos), que reutilizar un PDF a medias.
+                        ContratoCacheOrm.pdf_sharepoint_web_url.is_not(
+                            None
+                        ),
+                    )
+                )
+                # La version mas reciente de cada codigo gana (el bucle
+                # de abajo se queda con la PRIMERA aparicion).
+                .order_by(
+                    ContratoCacheOrm.fecha_alta_contrato.desc().nulls_last(),
+                    ContratoCacheOrm.id.desc(),
+                )
+            )
+            out: dict[str, tuple[int | None, str | None, str | None]] = {}
+            for codigo, gra_rep_ide, rel_path, web_url in session.execute(
+                stmt
+            ):
+                if codigo in out:
+                    continue
+                out[codigo] = (gra_rep_ide, rel_path, web_url)
+            logger.info(
+                "%s get_pdf_paths_for_codigos obra=%s cif=%s pedidos=%s "
+                "-> %s con PDF en cache.",
+                _LOG_PREFIX,
+                codigo_obra,
+                cif_proveedor,
+                len(codigos),
+                len(out),
+            )
+            return out
+
     @staticmethod
     def _orm_to_dto(
         cabecera: ContratoCacheOrm,

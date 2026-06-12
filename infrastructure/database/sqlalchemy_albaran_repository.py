@@ -1065,12 +1065,42 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "nombre_proveedor",
                 "codigo_obra",
                 "nombre_obra",
-                "gra_rep_ide",
-                "pdf_sharepoint_relative_path",
-                "pdf_sharepoint_web_url",
                 "fetched_at_utc",
             )
         }
+        # ------------------------------------------------------------ #
+        # FIX (jun 2026) — los paths del PDF NUNCA regresan a NULL.
+        #
+        # Antes ``pdf_sharepoint_*`` y ``gra_rep_ide`` se machacaban con
+        # EXCLUDED tal cual. El enrichment solo rellena esos campos en el
+        # DTO cuando pudo REUTILIZAR un PDF previo (mismo gra_rep_ide);
+        # en cualquier otro caso llegan a None y el UPSERT BORRABA los
+        # paths ya guardados. Combinado con el filtro de descarga
+        # "solo el contrato seleccionado" (Paso 5-bis del enrichment),
+        # el resultado era: PDF subido a SharePoint pero fila sin URL →
+        # el botón "Abrir contrato en SharePoint" desaparecía del
+        # portal (bug reportado).
+        #
+        # Con COALESCE(EXCLUDED.x, tabla.x):
+        #   - Si el DTO trae paths (reutilización o re-descarga ya
+        #     resuelta) → se actualizan.
+        #   - Si el DTO trae None → se CONSERVAN los de BBDD. Si el
+        #     gra_rep_ide cambió de verdad, el Paso 7 del enrichment
+        #     re-descarga y ``update_contrato_pdf_paths`` pisa los
+        #     paths con los nuevos; aquí solo evitamos la regresión.
+        # ------------------------------------------------------------ #
+        update_columns["gra_rep_ide"] = func.coalesce(
+            stmt.excluded.gra_rep_ide,
+            AlbaranContratoMergeOrm.gra_rep_ide,
+        )
+        update_columns["pdf_sharepoint_relative_path"] = func.coalesce(
+            stmt.excluded.pdf_sharepoint_relative_path,
+            AlbaranContratoMergeOrm.pdf_sharepoint_relative_path,
+        )
+        update_columns["pdf_sharepoint_web_url"] = func.coalesce(
+            stmt.excluded.pdf_sharepoint_web_url,
+            AlbaranContratoMergeOrm.pdf_sharepoint_web_url,
+        )
         stmt = stmt.on_conflict_do_update(
             index_elements=["document_id", "sigrid_ide"],
             index_where=text("sigrid_ide IS NOT NULL"),
@@ -1262,6 +1292,49 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 {"codigo": codigo_contrato, "doc_id": document_id},
             )
             session.commit()
+
+    def update_merge_proveedor_nombre(
+        self,
+        *,
+        document_id: str,
+        nombre_proveedor: str,
+    ) -> bool:
+        """Sobrescribe ``proveedor_nombre`` con la razon social canonica
+        de Sigrid (``prv.raz``).
+
+        Implementa el puerto declarado en
+        ``domain/ports/contrato_merge_repository_port.py`` que hasta
+        ahora NO tenia implementacion (la canonizacion del nombre de
+        proveedor "existia" en el contrato del puerto pero nadie la
+        ejecutaba — bug reportado: al elegir un proveedor existente, el
+        nombre no se actualizaba con el de Sigrid).
+
+        Devuelve True si cambio el valor; False si fue no-op (nombre
+        vacio o identico). KeyError si el documento no existe.
+        """
+        nombre_clean = (nombre_proveedor or "").strip()
+        if not nombre_clean:
+            return False
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            document = session.get(AlbaranDocumentMergeOrm, document_id)
+            if document is None:
+                raise KeyError(
+                    f"Documento merge no encontrado: {document_id}"
+                )
+            actual = (document.proveedor_nombre or "").strip()
+            if actual == nombre_clean:
+                return False
+            document.proveedor_nombre = nombre_clean
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] proveedor_nombre canonizado "
+                "doc=%s %r -> %r",
+                document_id,
+                actual or None,
+                nombre_clean,
+            )
+            return True
 
     def _delete_existing_records(self, *, session: Any, source_sha256: str) -> None:
         merge_docs = session.scalars(
