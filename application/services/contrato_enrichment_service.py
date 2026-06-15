@@ -785,6 +785,51 @@ class ContratoEnrichmentService:
             )
             return None, None
 
+        # ---- Markdown del contrato (markitdown / LibreOffice) ----
+        # Se sube junto al PDF para que la IA (sv5) lo consuma. Best-effort:
+        # si falla, el contrato sigue valiendo (se mantiene el PDF). El
+        # ``markdown`` lo genera el cliente Sigrid al combinar las fuentes.
+        md_text = getattr(payload, "markdown", None)
+        if md_text:
+            try:
+                stored_md = self._pdf_storage.upload_contrato_md(
+                    markdown=md_text,
+                    codigo_contrato=contrato.codigo_contrato,
+                    gra_rep_ide=contrato.gra_rep_ide,
+                )
+                logger.info(
+                    "%s MD OK codigo=%s -> %s (%s chars)",
+                    _LOG_PREFIX,
+                    contrato.codigo_contrato,
+                    stored_md.relative_path,
+                    len(md_text),
+                )
+                # Persistimos el path del MD si el repositorio lo soporta
+                # (defensivo: funciona aunque aún no exista el método).
+                _persist_md = getattr(
+                    self._repository, "update_contrato_md_paths", None
+                )
+                if callable(_persist_md):
+                    _persist_md(
+                        document_id=document_id,
+                        codigo_contrato=contrato.codigo_contrato,
+                        relative_path=stored_md.relative_path,
+                        web_url=stored_md.web_url,
+                    )
+            except Exception:
+                logger.exception(
+                    "%s FALLO subiendo/persistiendo MD codigo=%s (se continua).",
+                    _LOG_PREFIX,
+                    contrato.codigo_contrato,
+                )
+        else:
+            logger.info(
+                "%s sin markdown en el payload del contrato codigo=%s "
+                "(revisa que LibreOffice/markitdown esten disponibles).",
+                _LOG_PREFIX,
+                contrato.codigo_contrato,
+            )
+
         # El UPDATE de BBDD ha ido bien. Devolvemos los paths al caller
         # para que reconstruya el DTO en memoria. Si NO los propagara,
         # el paso C (caché) escribiría pdf_sharepoint_* = None en

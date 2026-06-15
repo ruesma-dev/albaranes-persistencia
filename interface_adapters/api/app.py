@@ -69,6 +69,7 @@ from infrastructure.database.sqlalchemy_albaran_repository import (
 from infrastructure.database.sqlalchemy_contrato_cache_repository import (
     SqlAlchemyContratoCacheRepository,
 )
+from ruesma_comun.office import build_word_converter
 from infrastructure.sigrid.sigrid_api_contrato_client import (
     SigridApiContratoClient,
 )
@@ -121,6 +122,15 @@ def build_app(settings: Settings) -> FastAPI:
         create_link=settings.sharepoint_create_link,
     )
 
+    # Conversor Word→PDF/MD de contratos. document_storage es un
+    # GraphSharePointClient (tiene convert_to_pdf), así que el backend
+    # "graph" usa el motor de Office 365. Si se pide "graph" sin Graph
+    # utilizable, build_word_converter degrada a LibreOffice solo.
+    word_converter = build_word_converter(
+        settings.word_to_pdf_backend,
+        graph_client=document_storage,
+    )
+
     # ----------------------------------------------------------- #
     # Sigrid — enriquecimiento obra + contrato.
     # Solo se cablean si las 3 credenciales están presentes.
@@ -143,6 +153,7 @@ def build_app(settings: Settings) -> FastAPI:
             function_key=settings.sigrid_api_function_key,
             database=settings.sigrid_api_database,
             timeout_s=settings.sigrid_api_timeout_s,
+            word_converter=word_converter,
         )
 
         # Resolucion determinista de cabecera (obra_codigo / proveedor_cif

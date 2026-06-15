@@ -243,6 +243,10 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "ADD COLUMN IF NOT EXISTS pdf_sharepoint_relative_path VARCHAR(1024)",
                 "ALTER TABLE albaran_contratos_merge "
                 "ADD COLUMN IF NOT EXISTS pdf_sharepoint_web_url VARCHAR(1024)",
+                "ALTER TABLE albaran_contratos_merge "
+                "ADD COLUMN IF NOT EXISTS md_sharepoint_relative_path VARCHAR(1024)",
+                "ALTER TABLE albaran_contratos_merge "
+                "ADD COLUMN IF NOT EXISTS md_sharepoint_web_url VARCHAR(1024)",
             ]
         )
 
@@ -1268,6 +1272,42 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             session.commit()
             logger.info(
                 "[contrato-enrichment][repo] update_contrato_pdf_paths "
+                "doc=%s codigo=%s rel=%s url=%s",
+                document_id,
+                codigo_contrato,
+                relative_path,
+                web_url,
+            )
+
+    def update_contrato_md_paths(
+        self,
+        *,
+        document_id: str,
+        codigo_contrato: str,
+        relative_path: str | None,
+        web_url: str | None,
+    ) -> None:
+        """Actualiza los paths del Markdown del contrato (lo consume sv5)."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            session.execute(
+                text(
+                    "UPDATE albaran_contratos_merge "
+                    "SET md_sharepoint_relative_path = :rel, "
+                    "    md_sharepoint_web_url = :url "
+                    "WHERE document_id = :doc_id "
+                    "  AND codigo_contrato = :codigo"
+                ),
+                {
+                    "rel": relative_path,
+                    "url": web_url,
+                    "doc_id": document_id,
+                    "codigo": codigo_contrato,
+                },
+            )
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] update_contrato_md_paths "
                 "doc=%s codigo=%s rel=%s url=%s",
                 document_id,
                 codigo_contrato,

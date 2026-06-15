@@ -70,6 +70,8 @@ class AlbaranContratoMergeOrm(Base):
     gra_rep_ide = Column(Integer, nullable=True)
     pdf_sharepoint_relative_path = Column(String(1024), nullable=True)
     pdf_sharepoint_web_url = Column(String(1024), nullable=True)
+    md_sharepoint_relative_path = Column(String(1024), nullable=True)
+    md_sharepoint_web_url = Column(String(1024), nullable=True)
     fetched_at_utc = Column(String(64), nullable=False)
 
     lines = relationship(

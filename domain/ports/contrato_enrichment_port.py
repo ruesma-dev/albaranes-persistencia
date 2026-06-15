@@ -14,11 +14,19 @@ class ContratoPdfPayload:
     El nombre viene del header ``X-Document-Filename`` del endpoint
     ``/api/documents/read`` cuando existe, o del fallback que decida
     el adaptador (p.e. ``contrato_<codigo>.pdf``).
+
+    ``markdown`` (jun 2026): además del PDF combinado, el cliente genera
+    el Markdown del contrato a partir de las MISMAS fuentes de Sigrid
+    (Word vía markitdown conserva las tablas de tarifas; PDF digital se
+    extrae como texto). Es lo que sv5 envía a la IA en modo texto puro.
+    Puede ser ``None`` si la conversión no fue posible (entonces sv5 cae
+    al PDF como adjunto).
     """
 
     filename: str
     content: bytes
     content_type: str | None
+    markdown: str | None = None
 
 
 class ContratoEnrichmentClient(Protocol):

@@ -64,6 +64,11 @@ class Settings(BaseSettings):
         alias="SHAREPOINT_FOLDER_ROOT",
     )
     sharepoint_link_type: str = Field("view", alias="SHAREPOINT_LINK_TYPE")
+
+    # Conversor Word→PDF de contratos: "graph" (Microsoft 365, máxima
+    # fidelidad, sirve igual en local y Azure) o "libreoffice" (headless;
+    # necesita soffice / imagen con libreoffice-writer).
+    word_to_pdf_backend: str = Field("graph", alias="WORD_TO_PDF_BACKEND")
     sharepoint_link_scope: str = Field(
         "organization",
         alias="SHAREPOINT_LINK_SCOPE",

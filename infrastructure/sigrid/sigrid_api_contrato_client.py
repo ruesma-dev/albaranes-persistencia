@@ -17,6 +17,13 @@ from domain.ports.contrato_enrichment_port import ContratoPdfPayload
 from infrastructure.documents import docx_pdf_renderer as docx_renderer
 from infrastructure.documents.simple_pdf_writer import build_text_pdf
 from infrastructure.documents.word_text_extractor import extract_text
+from ruesma_comun.markdown import a_markdown
+from ruesma_comun.office import (
+    LibreOfficeWordConverter,
+    combinar_pdfs,
+    es_word,
+    pdf_a_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +191,7 @@ class SigridApiContratoClient:
         max_rows: int = 1000,
         database_rep: str = "ruesma_rep",
         pdf_timeout_s: float = 120.0,
+        word_converter=None,
     ) -> None:
         if not base_url:
             raise ValueError("SigridApiContratoClient requiere base_url")
@@ -205,6 +213,10 @@ class SigridApiContratoClient:
         self._timeout_s = float(timeout_s)
         self._max_rows = int(max_rows)
         self._pdf_timeout_s = float(pdf_timeout_s)
+        # Conversor Word→PDF/MD inyectable (LibreOffice o Graph). Por
+        # defecto LibreOffice para no cambiar el comportamiento si el
+        # composition root no inyecta nada.
+        self._word_converter = word_converter or LibreOfficeWordConverter()
         logger.info(
             "%s Instanciado. base_url=%s database=%s database_rep=%s "
             "max_rows=%s pdf_timeout_s=%s key_len=%s",
@@ -317,10 +329,25 @@ class SigridApiContratoClient:
         if raw is None:
             return None
         filename, content, content_type = raw
+        nombre = filename or f"contrato_{gra_rep_ide}.pdf"
+        if es_word(nombre):
+            ext = ".docx" if nombre.lower().endswith(".docx") else ".doc"
+            md = self._word_converter.word_a_markdown(content, ext)
+            # Renderizamos el Word a PDF (estructura conservada) para el
+            # revisor; si el conversor no puede, dejamos el Word tal cual.
+            pdf = self._word_converter.word_a_pdf(content, ext)
+            if pdf:
+                stem = nombre.rsplit(".", 1)[0]
+                content = pdf
+                content_type = "application/pdf"
+                nombre = f"{stem}.pdf"
+        else:
+            md = pdf_a_markdown(content)
         return ContratoPdfPayload(
-            filename=filename or f"contrato_{gra_rep_ide}.pdf",
+            filename=nombre,
             content=content,
             content_type=content_type,
+            markdown=md,
         )
 
     def _download_and_merge_pdfs(
@@ -366,6 +393,7 @@ class SigridApiContratoClient:
                     filename=filename or f"contrato_{rep_ide}.pdf",
                     content=content,
                     content_type=content_type,
+                    markdown=pdf_a_markdown(content),
                 )
 
         if not blobs:
@@ -403,6 +431,7 @@ class SigridApiContratoClient:
             filename=filename,
             content=merged,
             content_type="application/pdf",
+            markdown=pdf_a_markdown(merged),
         )
 
     def _download_and_combine_words(
@@ -411,32 +440,30 @@ class SigridApiContratoClient:
         primary_ide: int,
         docs: list[dict[str, Any]],
     ) -> ContratoPdfPayload | None:
-        """Descarga los Word del plan y los combina en UN PDF.
+        """Descarga los Word del plan y los combina en UN PDF + Markdown.
 
-        Estrategia (jun 2026):
-          - Vía PREFERENTE: renderizar cada ``.docx`` a HTML con mammoth
-            (conserva encabezados, párrafos, listas y TABLAS de tarifas)
-            y combinar todo a un PDF con xhtml2pdf. Así el LLM de sv5
-            recibe las tablas de precios como tablas reales, no como
-            texto aplanado con `` | ``.
-          - Vía FALLBACK (si el renderer no está disponible, el archivo
-            es ``.doc`` binario, o el render falla): el método antiguo de
-            extraer texto plano y volcarlo a un PDF de texto
-            (``build_text_pdf``). Nunca rompe el flujo.
+        Estrategia (jun 2026) — **LibreOffice** (headless), que lee `.doc`
+        y `.docx` reales conservando la estructura (tablas de tarifas
+        incluidas). Al contrario que la extracción de texto, que sobre un
+        `.doc` binario volcaba la estructura OLE (themes, fuentes, XML)
+        como basura, tanto al PDF del revisor como a la IA.
+
+          - Cada Word → PDF (LibreOffice); se fusionan página a página →
+            PDF que consulta el revisor, bien estructurado.
+          - Cada Word → HTML (LibreOffice) → Markdown (markitdown); las
+            tablas salen como tablas Markdown. Es lo que consume la IA.
+
+        Si LibreOffice no está disponible, degrada al render anterior
+        (mammoth/xhtml2pdf para .docx; texto plano para .doc).
 
         El orden de ``docs`` ya viene del más antiguo al más moderno.
-        Si algún Word falla se continúa con los demás (mejor un contrato
-        parcial que el audit-trail); si fallan todos, None.
         """
-        use_renderer = docx_renderer.renderer_available()
-
-        # Por cada documento guardamos su título y AMBAS representaciones:
-        #   - html: fragmento estructurado (solo .docx vía mammoth)
-        #   - texto: texto plano (siempre, como fallback)
-        # Así, si al final el render falla, tenemos el texto listo sin
-        # re-descargar.
+        pdf_parts: list[bytes] = []
+        md_sections: list[str] = []
+        # Material del render ANTIGUO (solo se usa si LibreOffice no está).
         html_sections: list[tuple[str, str]] = []
         text_sections: list[tuple[str, str]] = []
+        use_renderer = docx_renderer.renderer_available()
         any_html = False
 
         for doc in docs:
@@ -465,24 +492,26 @@ class SigridApiContratoClient:
                 else "sin fecha"
             )
             titulo = f"DOCUMENTO: {doc.get('name') or filename} ({fec_str})"
+            ext = ".docx" if (filename or "").lower().endswith(".docx") else ".doc"
 
-            # Texto plano (siempre disponible como fallback).
-            texto = extract_text(filename, content)
-            if not texto:
-                texto = "(no se pudo extraer texto de este documento)"
+            # --- Vía preferente: LibreOffice (PDF con estructura + MD) ---
+            pdf_part = self._word_converter.word_a_pdf(content, ext)
+            if pdf_part:
+                pdf_parts.append(pdf_part)
+            md_part = self._word_converter.word_a_markdown(content, ext)
+            if md_part:
+                md_sections.append(f"## {titulo}\n\n{md_part}")
+
+            # --- Material de fallback (por si LibreOffice no estuviese) ---
+            texto = extract_text(filename, content) or "(sin texto)"
             text_sections.append((titulo, texto))
-
-            # HTML estructurado (solo .docx y solo si el renderer existe).
-            html_frag: str | None = None
-            is_docx = (filename or "").lower().endswith(".docx")
-            if use_renderer and is_docx:
+            html_frag = None
+            if use_renderer and ext == ".docx":
                 html_frag = docx_renderer.docx_to_html_fragment(content)
             if html_frag:
                 any_html = True
                 html_sections.append((titulo, html_frag))
             else:
-                # .doc binario o fallo de mammoth: incrustamos su texto
-                # como bloque <pre> para no perderlo en el PDF combinado.
                 html_sections.append(
                     (titulo, docx_renderer.text_to_html_fragment(texto))
                 )
@@ -499,35 +528,42 @@ class SigridApiContratoClient:
         stem = base.rsplit(".", 1)[0]
         filename = f"{stem}_COMBINADO.pdf"
 
-        # Vía preferente: PDF renderizado con estructura.
-        pdf_bytes: bytes | None = None
-        if use_renderer and any_html:
-            pdf_bytes = docx_renderer.combine_html_to_pdf(html_sections)
-            if pdf_bytes:
-                logger.info(
-                    "%s COMBINE (render): %s sección(es) → %s (%s bytes), "
-                    "tablas conservadas.",
-                    _LOG_PREFIX,
-                    len(html_sections),
-                    filename,
-                    len(pdf_bytes),
-                )
-
-        # Fallback: PDF de texto plano (método antiguo).
-        if not pdf_bytes:
-            pdf_bytes = build_text_pdf(text_sections)
+        # PDF: preferimos la fusión de los PDF de LibreOffice (estructura).
+        pdf_bytes = combinar_pdfs(pdf_parts) if pdf_parts else None
+        if pdf_bytes:
             logger.info(
-                "%s COMBINE (texto/fallback): %s sección(es) → %s (%s bytes).",
+                "%s COMBINE (libreoffice): %s doc(s) → %s (%s bytes), "
+                "estructura conservada.",
+                _LOG_PREFIX,
+                len(pdf_parts),
+                filename,
+                len(pdf_bytes),
+            )
+        else:
+            if use_renderer and any_html:
+                pdf_bytes = docx_renderer.combine_html_to_pdf(html_sections)
+            if not pdf_bytes:
+                pdf_bytes = build_text_pdf(text_sections)
+            logger.info(
+                "%s COMBINE (fallback sin libreoffice): %s sección(es) → %s.",
                 _LOG_PREFIX,
                 len(text_sections),
                 filename,
-                len(pdf_bytes),
+            )
+
+        markdown = "\n\n---\n\n".join(md_sections).strip() or None
+        if markdown:
+            logger.info(
+                "%s COMBINE: markdown generado (%s chars) para la IA.",
+                _LOG_PREFIX,
+                len(markdown),
             )
 
         return ContratoPdfPayload(
             filename=filename,
             content=pdf_bytes,
             content_type="application/pdf",
+            markdown=markdown,
         )
 
     def _download_document_raw(
