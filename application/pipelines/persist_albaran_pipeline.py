@@ -30,6 +30,9 @@ class PersistAlbaranRequest:
     file_bytes: bytes
     extraction_envelope: Dict[str, Any]
     context: Dict[str, Any]
+    # Re-fetch manual de contratos desde el portal (sv4): si True, el
+    # enrichment de contratos bypasa la caché y re-consulta Sigrid.
+    force_refetch: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ class PersistAlbaranPipeline:
             self._enrich_obra_safely(merge_document_id=existing.document_id)
             contratos_count = self._enrich_contratos_safely(
                 merge_document_id=existing.document_id,
+                force_refetch=request.force_refetch,
             )
             self._trigger_valuation_safely(
                 merge_document_id=existing.document_id,
@@ -188,6 +192,7 @@ class PersistAlbaranPipeline:
         self._enrich_obra_safely(merge_document_id=saved.document_id)
         contratos_count = self._enrich_contratos_safely(
             merge_document_id=saved.document_id,
+            force_refetch=request.force_refetch,
         )
         self._trigger_valuation_safely(merge_document_id=saved.document_id)
         selected_codigo = self._read_selected_contrato_safely(
@@ -256,13 +261,20 @@ class PersistAlbaranPipeline:
                 merge_document_id,
             )
 
-    def _enrich_contratos_safely(self, *, merge_document_id: str) -> int:
-        """Devuelve el nº de contratos persistidos (0 si falló o no hay servicio)."""
+    def _enrich_contratos_safely(
+        self, *, merge_document_id: str, force_refetch: bool = False,
+    ) -> int:
+        """Devuelve el nº de contratos persistidos (0 si falló o no hay servicio).
+
+        ``force_refetch`` (re-fetch manual desde el portal sv4): bypasa la
+        caché de contratos del enrichment y re-consulta Sigrid.
+        """
         logger.info(
             "[contrato-enrichment][pipeline] pre-step: service_present=%s "
-            "merge_document_id=%s",
+            "merge_document_id=%s force_refetch=%s",
             self._contrato_enrichment_service is not None,
             merge_document_id,
+            force_refetch,
         )
         if self._contrato_enrichment_service is None:
             logger.warning(
@@ -272,6 +284,7 @@ class PersistAlbaranPipeline:
         try:
             count = self._contrato_enrichment_service.enrich_merge_document(
                 merge_document_id=merge_document_id,
+                force_refetch=force_refetch,
             )
             return int(count) if count is not None else 0
         except Exception:

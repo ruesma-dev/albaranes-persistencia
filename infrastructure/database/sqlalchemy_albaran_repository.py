@@ -324,6 +324,28 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "CREATE INDEX IF NOT EXISTS ix_albaran_contrato_lines_merge_partida "
                 "ON albaran_contrato_lines_merge (codigo_partida)"
             ),
+            # ------------------------------------------------------------ #
+            # Índices únicos PARCIALES que respaldan el UPSERT de contratos:
+            #   - cabecera: ON CONFLICT (document_id, sigrid_ide)
+            #   - líneas:   ON CONFLICT (contrato_id, sigrid_ide)
+            # Sin ellos, el ON CONFLICT lanza "no unique or exclusion
+            # constraint matching" y (antes de los savepoints) abortaba el
+            # lote entero — causa raíz del e2e. Parciales (WHERE sigrid_ide
+            # IS NOT NULL) para no chocar con filas legacy sin sigrid_ide.
+            # IF NOT EXISTS → idempotente y seguro si ya se crearon a mano.
+            # ------------------------------------------------------------ #
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_albaran_contratos_merge_doc_sigrid "
+                "ON albaran_contratos_merge (document_id, sigrid_ide) "
+                "WHERE sigrid_ide IS NOT NULL"
+            ),
+            (
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_albaran_contrato_lines_merge_ctr_sigrid "
+                "ON albaran_contrato_lines_merge (contrato_id, sigrid_ide) "
+                "WHERE sigrid_ide IS NOT NULL"
+            ),
         ]
 
         with self._session_factory.create_session() as session:
@@ -902,16 +924,34 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
 
             cabeceras_upserted = 0
             cabeceras_inserted_legacy = 0
+            cabeceras_failed = 0
             total_lines_upserted = 0
             total_lines_inserted_legacy = 0
+            total_lines_failed = 0
 
             for contrato in contratos:
-                cabecera_id, was_upsert = self._upsert_contrato_cabecera(
-                    session=session,
-                    contrato=contrato,
-                    document_id=document_id,
-                    now=now,
-                )
+                # Savepoint por CABECERA: si el upsert de la cabecera falla
+                # (p. ej. ON CONFLICT sin índice, dato corrupto), se revierte
+                # SOLO este contrato y la transacción del lote sigue viva.
+                cabecera_id = None
+                was_upsert = False
+                try:
+                    with session.begin_nested():
+                        cabecera_id, was_upsert = self._upsert_contrato_cabecera(
+                            session=session,
+                            contrato=contrato,
+                            document_id=document_id,
+                            now=now,
+                        )
+                except Exception:  # noqa: BLE001 — aislar el fallo de cabecera
+                    cabecera_id = None
+                    cabeceras_failed += 1
+                    logger.exception(
+                        "[contrato-enrichment][repo] upsert_contratos: "
+                        "cabecera codigo=%s falló; se revierte su savepoint "
+                        "y se continúa con el resto del lote.",
+                        contrato.codigo_contrato,
+                    )
                 if cabecera_id is None:
                     logger.warning(
                         "[contrato-enrichment][repo] upsert_contratos: "
@@ -926,13 +966,27 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                     cabeceras_inserted_legacy += 1
 
                 for line in (contrato.lines or []):
-                    line_was_upsert = self._upsert_contrato_linea(
-                        session=session,
-                        line=line,
-                        contrato_id=cabecera_id,
-                        codigo_contrato=contrato.codigo_contrato,
-                        now=now,
-                    )
+                    # Savepoint por LÍNEA: una línea defectuosa se omite sin
+                    # arrastrar al resto (antes un único fallo abortaba la
+                    # transacción y se perdían las 429 líneas en el commit).
+                    try:
+                        with session.begin_nested():
+                            line_was_upsert = self._upsert_contrato_linea(
+                                session=session,
+                                line=line,
+                                contrato_id=cabecera_id,
+                                codigo_contrato=contrato.codigo_contrato,
+                                now=now,
+                            )
+                    except Exception:  # noqa: BLE001 — aislar el fallo de línea
+                        total_lines_failed += 1
+                        logger.exception(
+                            "[contrato-enrichment][repo] upsert_contratos: "
+                            "línea de contrato codigo=%s falló; se revierte "
+                            "su savepoint y se continúa.",
+                            contrato.codigo_contrato,
+                        )
+                        continue
                     if line_was_upsert:
                         total_lines_upserted += 1
                     else:
@@ -943,14 +997,18 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "[contrato-enrichment][repo] upsert_contratos: "
                 "document_id=%s contratos=%s "
                 "cabeceras_upsert=%s cabeceras_legacy_insert=%s "
+                "cabeceras_failed=%s "
                 "lineas_upsert=%s lineas_legacy_insert=%s "
+                "lineas_failed=%s "
                 "pdfs_con_path_inicial=%s",
                 document_id,
                 len(contratos),
                 cabeceras_upserted,
                 cabeceras_inserted_legacy,
+                cabeceras_failed,
                 total_lines_upserted,
                 total_lines_inserted_legacy,
+                total_lines_failed,
                 sum(
                     1
                     for c in contratos
@@ -1287,7 +1345,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         relative_path: str | None,
         web_url: str | None,
     ) -> None:
-        """Actualiza los paths del Markdown del contrato (lo consume sv5)."""
+        """Actualiza los paths del MARKDOWN para un contrato concreto.
+
+        El sv5 prefiere el MD del contrato (lo manda como texto y no
+        adjunta el PDF); para que lo encuentre, el enrichment persiste
+        aquí el ``md_sharepoint_relative_path`` tras subirlo a SharePoint.
+        """
         self.initialize()
         with self._session_factory.create_session() as session:
             session.execute(

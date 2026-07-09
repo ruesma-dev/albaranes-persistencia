@@ -130,15 +130,13 @@ def _select_contract_docs(
     donde se descargaba el audit-trail de Signaturit en lugar del
     contrato). Los nombres con audit/trail se excluyen SIEMPRE:
 
-    1. Si hay documentos Word (.doc/.docx): se cogen TODOS, ordenados
-       del más antiguo al más moderno (fecha, desempate por posición).
-       Son los documentos "fuente" del contrato (original + ampliaciones)
-       y se combinarán (texto extraído) en un único PDF.
-       → ("words", [todos los word ordenados])
-    2. Si NO hay Word: se cogen TODOS los PDF (sin audit/trail),
-       ordenados del más antiguo al más moderno, y se FUSIONARÁN
-       página a página en un único PDF (formato original intacto).
+    1. Si hay PDF (sin audit/trail): se cogen TODOS, ordenados del más
+       antiguo al más moderno, y se FUSIONAN página a página en un único
+       PDF (formato original intacto, mejor para tablas/precios).
        → ("pdfs", [todos los pdf ordenados])
+    2. Si NO hay PDF: se cogen TODOS los Word (.doc/.docx), ordenados, y
+       se combinan (texto extraído) en un único PDF.
+       → ("words", [todos los word ordenados])
     3. Si no queda nada (p.e. solo audit-trails): → ("none", []).
     """
 
@@ -150,14 +148,11 @@ def _select_contract_docs(
     def is_audit(d: dict[str, Any]) -> bool:
         return bool(_AUDIT_NAME_RX.search(str(d.get("name") or "")))
 
-    words = [
-        d for d in docs
-        if str(d.get("name") or "").lower().endswith(_WORD_EXTS)
-        and not is_audit(d)
-    ]
-    if words:
-        return "words", sorted(words, key=sort_key)
-
+    # PRIORIDAD PDF sobre Word (jul 2026, cambio pedido): el PDF final
+    # del contrato conserva mejor tablas/formato (líneas de contenedor,
+    # precios) que el texto extraído del Word fuente. Los audit/trail
+    # (firmas) se excluyen SIEMPRE. En ambas ramas se genera el markdown
+    # (pdf_a_markdown / word_a_markdown) que consume la IA de sv5.
     pdfs = [
         d for d in docs
         if str(d.get("name") or "").lower().endswith(".pdf")
@@ -165,6 +160,14 @@ def _select_contract_docs(
     ]
     if pdfs:
         return "pdfs", sorted(pdfs, key=sort_key)
+
+    words = [
+        d for d in docs
+        if str(d.get("name") or "").lower().endswith(_WORD_EXTS)
+        and not is_audit(d)
+    ]
+    if words:
+        return "words", sorted(words, key=sort_key)
 
     return "none", []
 
