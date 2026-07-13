@@ -10,6 +10,8 @@ unico; si no, queda pendiente de seleccion (lo retoma sv4).
 from __future__ import annotations
 
 import logging
+
+from ruesma_comun.blobs.almacen import BlobNoEncontradoError
 from typing import Callable
 
 from application.pipelines.persist_albaran_pipeline import (
@@ -63,7 +65,37 @@ def construir_handler_persistencia(
             force_refetch,
         )
 
-        doc = fuente_documento.obtener(document_id)
+        # Los mensajes de q-persistencia llegan con DOS espacios de id:
+        #   - document_id de ORIGEN (sv1/sv2): existe blob input/{id}.pdf
+        #     -> persist completo (camino normal).
+        #   - MERGE id (sv4: seleccion de contrato / re-fetch): NO hay
+        #     blob -> re-enrichment del merge (baja PDF/MD del contrato
+        #     seleccionado y encadena la valoracion).
+        try:
+            doc = fuente_documento.obtener(document_id)
+        except BlobNoEncontradoError:
+            logger.info(
+                "[sv3-worker] sin blob para %s; se intenta como MERGE id "
+                "(mensaje de sv4).",
+                document_id,
+            )
+            ok = pipeline.reenrich_by_merge_id(
+                merge_document_id=document_id,
+                force_refetch=force_refetch,
+            )
+            if ok:
+                logger.info(
+                    "[sv3-worker] document_id=%s OK -> re-enriquecido "
+                    "(merge)",
+                    document_id,
+                )
+            else:
+                logger.error(
+                    "[sv3-worker] document_id=%s NO es blob NI merge; "
+                    "mensaje descartado (reintentar no ayuda).",
+                    document_id,
+                )
+            return
         envelope = _sanear_envelope(fuente_envelope.obtener(document_id))
         context = (
             {"correlation_key": mensaje.correlation_key}

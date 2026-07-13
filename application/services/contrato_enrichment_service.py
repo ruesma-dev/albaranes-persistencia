@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 
 from application.services.obra_code_normalizer import normalize_obra_code
+from application.services.contrato_selector import (
+    elegir_contrato_probable,
+)
 from domain.models.contrato_models import ContratoEnrichmentResult
 from domain.ports.contrato_cache_port import ContratoCachePort
 from domain.ports.contrato_enrichment_port import ContratoEnrichmentClient
@@ -133,7 +137,45 @@ class ContratoEnrichmentService:
                 cif_clean,
                 obra_norm,
             )
+            # El albaran NO puede buscar contrato sin CIF+obra, asi que se
+            # queda sin valorar. ANTES esto pasaba en SILENCIO (el revisor
+            # no se enteraba de por que el documento no avanzaba). Ahora se
+            # deja un AVISO visible en "Notas de revision" indicando que
+            # falta exactamente, para que lo corrija y pulse "Guardar y
+            # volver a buscar".
+            faltan = []
+            if not cif_clean:
+                faltan.append("CIF del proveedor")
+            if not obra_norm:
+                faltan.append("codigo de obra")
+            try:
+                self._repository.append_review_note(
+                    document_id=merge_document_id,
+                    nota=(
+                        "[ACCION REQUERIDA] No se ha podido buscar contrato "
+                        f"en Sigrid: falta {' y '.join(faltan)}. El albaran "
+                        "queda SIN VALORAR. Corrige el dato arriba y pulsa "
+                        "\"Guardar y volver a buscar\"."
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - best-effort
+                logger.exception(
+                    "%s no se pudo dejar la nota de revision.", _LOG_PREFIX
+                )
             return 0
+
+        # Llegados aqui, CIF + obra SI son validos: si habia un aviso previo
+        # de "falta CIF/obra" (de un intento anterior), lo RETIRAMOS para que
+        # no contradiga lo que el revisor ve en pantalla.
+        try:
+            self._repository.remove_review_note_prefix(
+                document_id=merge_document_id,
+                prefijo="[ACCION REQUERIDA]",
+            )
+        except Exception:  # noqa: BLE001 - best-effort
+            logger.exception(
+                "%s no se pudo retirar el aviso obsoleto.", _LOG_PREFIX
+            )
 
         # ----------------------------------------------------------------
         # Paso A — Cache lookup (si la caché está disponible y no se
@@ -404,14 +446,63 @@ class ContratoEnrichmentService:
                     _LOG_PREFIX,
                 )
 
-        # Paso 8: auto-selección si hay uno solo.
+        # Paso 8: auto-selección.
+        #   - 1 contrato  -> ese.
+        #   - VARIOS      -> selector DETERMINISTA por familia/palabras
+        #     (p.ej. albaran de hormigon -> contrato de hormigon, no el de
+        #     mortero). Si no esta claro, no selecciona (decide el humano),
+        #     que es el comportamiento de siempre.
+        codigo = None
+        origen_sel = None
         if len(contratos) == 1:
             codigo = contratos[0].codigo_contrato
+            origen_sel = "auto_unico"
+        elif len(contratos) > 1:
+            try:
+                lineas_raw = self._repository.get_merge_lines_for_scoring(
+                    document_id=merge_document_id,
+                )
+                lineas = [_LineaScoring(r) for r in lineas_raw]
+                codigo = elegir_contrato_probable(
+                    contratos=contratos,
+                    lineas_albaran=lineas,
+                )
+                origen_sel = "auto_multiple" if codigo else None
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "%s ERROR en el selector determinista de contrato.",
+                    _LOG_PREFIX,
+                )
+                codigo = None
+
+        if codigo:
             try:
                 self._repository.set_selected_contrato(
                     document_id=merge_document_id,
                     codigo_contrato=codigo,
+                    origen=origen_sel,
                 )
+                if origen_sel == "auto_multiple":
+                    # Aviso VISIBLE para el revisor + baja de confianza
+                    # (sv4 penaliza origen 'auto_multiple' al calcular el
+                    # % del documento).
+                    self._repository.append_review_note(
+                        document_id=merge_document_id,
+                        nota=(
+                            f"[AVISO] Contrato {codigo} elegido "
+                            f"AUTOMATICAMENTE entre {len(contratos)} "
+                            "candidatos (criterio deterministico por "
+                            "familia/palabras). Verificar que es el "
+                            "correcto."
+                        ),
+                    )
+                    logger.warning(
+                        "%s contrato %s AUTO-SELECCIONADO entre %s "
+                        "candidatos (penaliza confianza).",
+                        _LOG_PREFIX,
+                        codigo,
+                        len(contratos),
+                    )
             except Exception:
                 logger.exception("%s ERROR auto-seleccionando contrato.", _LOG_PREFIX)
 
@@ -836,3 +927,26 @@ class ContratoEnrichmentService:
         # contratos_cache y rompería la reutilización de PDFs en
         # albaranes futuros que apunten al mismo contrato.
         return stored.relative_path, stored.web_url
+
+
+class _LineaScoring:
+    """Adaptador de una fila de albaran_lines_merge para el selector."""
+
+    def __init__(self, row: dict) -> None:
+        self.codigo = row.get("codigo")
+        self.concepto = row.get("concepto")
+        self.contexto_linea = None
+        raw = row.get("contexto_linea_json")
+        if raw:
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(data, dict):
+                    self.contexto_linea = _CtxScoring(data)
+            except Exception:  # noqa: BLE001
+                self.contexto_linea = None
+
+
+class _CtxScoring:
+    def __init__(self, data: dict) -> None:
+        self.tipo_familia = data.get("tipo_familia")
+        self.descripcion_extendida = data.get("descripcion_extendida")

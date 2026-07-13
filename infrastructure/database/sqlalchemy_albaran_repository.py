@@ -247,6 +247,10 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 "ADD COLUMN IF NOT EXISTS md_sharepoint_relative_path VARCHAR(1024)",
                 "ALTER TABLE albaran_contratos_merge "
                 "ADD COLUMN IF NOT EXISTS md_sharepoint_web_url VARCHAR(1024)",
+                "ALTER TABLE albaran_documents_merge "
+                "ADD COLUMN IF NOT EXISTS selected_contrato_origen VARCHAR(32)",
+                "ALTER TABLE albaran_documents_merge "
+                "ADD COLUMN IF NOT EXISTS review_notes TEXT",
             ]
         )
 
@@ -1337,6 +1341,32 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
                 web_url,
             )
 
+    def get_merge_lines_for_scoring(
+        self, *, document_id: str
+    ) -> list[dict]:
+        """Lineas del albaran (codigo/concepto/contexto) para puntuar
+        contratos cuando hay varios candidatos. Best-effort: si falla,
+        devuelve lista vacia (no se auto-selecciona)."""
+        self.initialize()
+        try:
+            with self._session_factory.create_session() as session:
+                rows = session.execute(
+                    text(
+                        "SELECT codigo, concepto, contexto_linea_json "
+                        "FROM albaran_lines_merge "
+                        "WHERE document_id = :doc_id"
+                    ),
+                    {"doc_id": document_id},
+                ).mappings().all()
+            return [dict(r) for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[contrato-selector] no se pudieron leer lineas para "
+                "puntuar (%s)",
+                exc,
+            )
+            return []
+
     def update_contrato_md_paths(
         self,
         *,
@@ -1383,16 +1413,102 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         *,
         document_id: str,
         codigo_contrato: str | None,
+        origen: str | None = None,
     ) -> None:
+        """Guarda la selección. ``origen``: 'auto_unico' | 'auto_multiple'
+        (selector determinista) | 'manual' | None (no tocar el origen).
+        'auto_multiple' penaliza la confianza calculada en sv4."""
         self.initialize()
         with self._session_factory.create_session() as session:
+            if origen is None:
+                session.execute(
+                    text(
+                        "UPDATE albaran_documents_merge "
+                        "SET selected_contrato_codigo = :codigo "
+                        "WHERE id = :doc_id"
+                    ),
+                    {"codigo": codigo_contrato, "doc_id": document_id},
+                )
+            else:
+                session.execute(
+                    text(
+                        "UPDATE albaran_documents_merge "
+                        "SET selected_contrato_codigo = :codigo, "
+                        "    selected_contrato_origen = :origen "
+                        "WHERE id = :doc_id"
+                    ),
+                    {
+                        "codigo": codigo_contrato,
+                        "origen": origen,
+                        "doc_id": document_id,
+                    },
+                )
+            session.commit()
+
+    def remove_review_note_prefix(
+        self, *, document_id: str, prefijo: str
+    ) -> None:
+        """Borra de ``review_notes`` las lineas que empiecen por ``prefijo``.
+
+        Se usa para retirar el aviso "[ACCION REQUERIDA] ... falta CIF ..."
+        cuando el dato YA se ha resuelto (p.ej. el revisor lo corrigio y el
+        enrichment ya encuentra contratos). Si no, el aviso se queda pegado
+        y contradice lo que ve el usuario en pantalla.
+        """
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            fila = session.execute(
+                text(
+                    "SELECT review_notes FROM albaran_documents_merge "
+                    "WHERE id = :doc_id"
+                ),
+                {"doc_id": document_id},
+            ).first()
+            if not fila or not fila[0]:
+                return
+            lineas = [
+                ln for ln in str(fila[0]).splitlines()
+                if not ln.strip().startswith(prefijo)
+            ]
+            nuevo = "\n".join(lineas).strip() or None
+            if nuevo == fila[0]:
+                return
             session.execute(
                 text(
                     "UPDATE albaran_documents_merge "
-                    "SET selected_contrato_codigo = :codigo "
-                    "WHERE id = :doc_id"
+                    "SET review_notes = :notas WHERE id = :doc_id"
                 ),
-                {"codigo": codigo_contrato, "doc_id": document_id},
+                {"notas": nuevo, "doc_id": document_id},
+            )
+            session.commit()
+            logger.info(
+                "[contrato-enrichment][repo] retirado aviso obsoleto (%s) "
+                "de review_notes doc=%s",
+                prefijo, document_id,
+            )
+
+    def append_review_note(
+        self, *, document_id: str, nota: str
+    ) -> None:
+        """Añade una nota (nueva línea) a review_notes sin pisar lo que
+        hubiera. Usada p.ej. para avisar de la auto-selección de contrato
+        entre varios candidatos."""
+        self.initialize()
+        with self._session_factory.create_session() as session:
+            # IDEMPOTENTE: si la MISMA nota ya esta, no la duplicamos (el
+            # albaran puede reprocesarse/re-fetchearse varias veces).
+            session.execute(
+                text(
+                    "UPDATE albaran_documents_merge "
+                    "SET review_notes = CASE "
+                    "  WHEN review_notes IS NULL OR review_notes = '' "
+                    "    THEN :nota "
+                    "  ELSE review_notes || E'\n' || :nota END "
+                    "WHERE id = :doc_id "
+                    "  AND (review_notes IS NULL "
+                    "       OR POSITION(:nota IN review_notes) = 0)"
+                ),
+                {"nota": nota, "doc_id": document_id},
             )
             session.commit()
 

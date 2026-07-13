@@ -238,6 +238,54 @@ class PersistAlbaranPipeline:
                 merge_document_id,
             )
 
+    def reenrich_by_merge_id(
+        self,
+        *,
+        merge_document_id: str,
+        force_refetch: bool = False,
+    ) -> bool:
+        """Re-enriquece un merge document EXISTENTE por su MERGE id.
+
+        Camino para los mensajes de sv4 (seleccion de contrato / re-fetch):
+        el front solo conoce el merge id, no el document_id de los blobs
+        (input/, envelopes/), asi que aqui NO se re-persiste desde blobs:
+        se ejecutan los mismos pasos que la rama de duplicado (resolver
+        cabecera, enriquecer obra y contratos con force, disparar la
+        valoracion). Devuelve False si el merge no existe.
+        """
+        try:
+            cif, obra_raw = self._repository.get_merge_cif_and_obra(
+                document_id=merge_document_id,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[pipeline][reenrich] error comprobando merge %s",
+                merge_document_id,
+            )
+            return False
+        if cif is None and obra_raw is None:
+            logger.warning(
+                "[pipeline][reenrich] merge %s no existe; nada que hacer.",
+                merge_document_id,
+            )
+            return False
+
+        logger.info(
+            "[pipeline][reenrich] merge=%s force_refetch=%s",
+            merge_document_id,
+            force_refetch,
+        )
+        self._resolve_header_deterministic_safely(
+            merge_document_id=merge_document_id,
+        )
+        self._enrich_obra_safely(merge_document_id=merge_document_id)
+        self._enrich_contratos_safely(
+            merge_document_id=merge_document_id,
+            force_refetch=force_refetch,
+        )
+        self._trigger_valuation_safely(merge_document_id=merge_document_id)
+        return True
+
     def _enrich_obra_safely(self, *, merge_document_id: str) -> None:
         logger.info(
             "[obra-enrichment][pipeline] pre-step: service_present=%s "
