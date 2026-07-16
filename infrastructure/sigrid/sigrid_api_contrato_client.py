@@ -13,6 +13,7 @@ from domain.models.contrato_models import (
     ContratoEnrichmentResult,
     ContratoLineFromSigrid,
 )
+from domain.models.header_resolution_models import ProveedorObraResumen
 from domain.ports.contrato_enrichment_port import ContratoPdfPayload
 from infrastructure.documents import docx_pdf_renderer as docx_renderer
 from infrastructure.documents.simple_pdf_writer import build_text_pdf
@@ -750,53 +751,17 @@ class SigridApiContratoClient:
         *,
         codigo_obra: str,
     ) -> list[tuple[str | None, str | None]]:
-        """Proveedores (cif, razon social canonica) con contrato en una
-        obra concreta. emp=1 (Construcciones Ruesma).
-
-        Usado por el HeaderGroundingService como lista de candidatos
-        para la IA de fase 2 cuando el CIF leido no valida pero la obra
-        si: el conjunto es corto y de maxima relevancia.
-        """
-        codigo = (codigo_obra or "").strip()
-        if not codigo:
-            return []
-        sql = (
-            "SELECT DISTINCT prv.cif AS cif, prv.raz AS nombre "
-            "FROM ctr "
-            "JOIN con AS con_ctr ON ctr.ide    = con_ctr.ide "
-            "JOIN con AS con_obr ON ctr.obride = con_obr.ide "
-            "JOIN prv            ON ctr.entide = prv.ide "
-            "WHERE con_obr.cod = ? "
-            "  AND con_ctr.emp = 1"
-        )
-        columns, rows = self._post_sql_read(
-            sql=sql,
-            parameters=[codigo],
-            database=self._database,
-            label=f"proveedores_por_obra_{codigo}",
-        )
-        out: list[tuple[str | None, str | None]] = []
-        seen: set[str] = set()
-        for row in rows:
-            row_map = dict(zip(columns, row))
-            cif = _opt_str(row_map.get("cif"))
-            if not cif or cif in seen:
-                continue
-            seen.add(cif)
-            out.append((cif, _opt_str(row_map.get("nombre"))))
-        return out
-
-    def fetch_proveedores_por_obra(
-        self,
-        *,
-        codigo_obra: str,
-    ) -> list[tuple[str | None, str | None]]:
         """Proveedores con contrato en una obra (emp=1), con razon
         social CANONICA (``prv.raz``).
 
         Usado por el HeaderGroundingService como lista de candidatos
         para que la 2ª IA case el nombre leido cuando el CIF no valido.
         Devuelve tuplas ``(cif, nombre)`` deduplicadas por CIF.
+
+        (jul 2026) Habia DOS definiciones identicas de este metodo en la
+        clase (resto de una entrega anterior): Python se quedaba con la
+        segunda en silencio. Consolidado en esta unica version, que es
+        la que ya estaba en efecto en runtime.
         """
         codigo = (codigo_obra or "").strip()
         if not codigo:
@@ -827,6 +792,86 @@ class SigridApiContratoClient:
             out.append((cif, _opt_str(row_map.get("nombre"))))
         logger.info(
             "%s proveedores_por_obra obra=%s -> %s proveedores",
+            _LOG_PREFIX,
+            codigo,
+            len(out),
+        )
+        return out
+
+    def fetch_contratos_resumen_por_obra(
+        self,
+        *,
+        codigo_obra: str,
+    ) -> list[ProveedorObraResumen]:
+        """Proveedores con contrato en la obra + TEXTO agregado de sus
+        contratos (nombre de contrato + descripciones de linea + codigos
+        de producto), para que el ``HeaderResolverService`` clasifique la
+        FAMILIA de cada proveedor (hormigon, mortero, residuos...) con
+        las mismas reglas que el selector de contratos (jul 2026).
+
+        emp=1 (Construcciones Ruesma). Una obra tiene pocos contratos,
+        asi que el volumen queda muy lejos del tope de 10.000 filas del
+        sigrid-api. Best-effort del llamante: si esto falla, el resolver
+        degrada al fallback global por nombre.
+        """
+        codigo = (codigo_obra or "").strip()
+        if not codigo:
+            return []
+        sql = (
+            "SELECT prv.cif        AS cif, "
+            "       prv.raz        AS nombre, "
+            "       con_ctr.cod    AS codigo_contrato, "
+            "       con_ctr.res    AS nombre_contrato, "
+            "       ctrpro.res     AS descripcion_linea, "
+            "       con_pro.cod    AS codigo_producto "
+            "FROM ctr "
+            "JOIN con AS con_ctr       ON ctr.ide     = con_ctr.ide "
+            "JOIN con AS con_obr       ON ctr.obride  = con_obr.ide "
+            "JOIN prv                  ON ctr.entide  = prv.ide "
+            "LEFT JOIN ctrpro          ON ctrpro.docide = ctr.ide "
+            "LEFT JOIN pro             ON ctrpro.proide = pro.ide "
+            "LEFT JOIN con AS con_pro  ON pro.ide       = con_pro.ide "
+            "WHERE con_obr.cod = ? "
+            "  AND con_ctr.emp = 1"
+        )
+        columns, rows = self._post_sql_read(
+            sql=sql,
+            parameters=[codigo],
+            database=self._database,
+            label=f"contratos_resumen_obra_{codigo}",
+        )
+        # Agrupacion por CIF conservando el orden de llegada.
+        nombres: "OrderedDict[str, str | None]" = OrderedDict()
+        codigos: dict[str, list[str]] = {}
+        textos: dict[str, list[str]] = {}
+        for row in rows:
+            row_map = dict(zip(columns, row))
+            cif = _opt_str(row_map.get("cif"))
+            if not cif:
+                continue
+            if cif not in nombres:
+                nombres[cif] = _opt_str(row_map.get("nombre"))
+                codigos[cif] = []
+                textos[cif] = []
+            cod_ctr = _opt_str(row_map.get("codigo_contrato"))
+            if cod_ctr and cod_ctr not in codigos[cif]:
+                codigos[cif].append(cod_ctr)
+            for campo in ("nombre_contrato", "descripcion_linea",
+                          "codigo_producto"):
+                valor = _opt_str(row_map.get(campo))
+                if valor:
+                    textos[cif].append(valor)
+        out = [
+            ProveedorObraResumen(
+                cif=cif,
+                nombre=nombres[cif],
+                codigos_contratos=tuple(codigos[cif]),
+                texto=" ".join(textos[cif]),
+            )
+            for cif in nombres
+        ]
+        logger.info(
+            "%s contratos_resumen_por_obra obra=%s -> %s proveedores",
             _LOG_PREFIX,
             codigo,
             len(out),

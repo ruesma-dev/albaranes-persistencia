@@ -139,6 +139,19 @@ class Settings(BaseSettings):
         0.5,
         alias="HEADER_RESOLVER_MIN_SCORE",
     )
+    # (jul 2026) Paso 1 del resolver de proveedor: deduccion por FAMILIA
+    # de producto entre los proveedores CON CONTRATO en la obra efectiva.
+    # Con False se vuelve al comportamiento clasico (solo nombre global).
+    header_resolver_familia_enabled: bool = Field(
+        True,
+        alias="HEADER_RESOLVER_FAMILIA_ENABLED",
+    )
+    # Nº maximo de candidatos listados en el AVISO de review_notes cuando
+    # el proveedor no se puede deducir con seguridad.
+    header_resolver_nota_max_candidatos: int = Field(
+        5,
+        alias="HEADER_RESOLVER_NOTA_MAX_CANDIDATOS",
+    )
 
     # ------------------------------------------------------------ #
     # Grounding de cabecera para la fase 2 (jun 2026).

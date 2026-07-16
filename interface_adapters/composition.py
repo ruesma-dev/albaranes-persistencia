@@ -103,6 +103,8 @@ def build_persist_pipeline(
             repository=repository,
             min_score=settings.header_resolver_min_score,
             enabled=settings.header_resolver_enabled,
+            familia_enabled=settings.header_resolver_familia_enabled,
+            nota_max_candidatos=settings.header_resolver_nota_max_candidatos,
         )
         obra_enrichment_service = ObraEnrichmentService(
             client=sigrid_obra_client,

@@ -18,29 +18,23 @@ Criterio (sin IA, por palabras):
 
 Ejemplo real: proveedor con 2 contratos (uno de HORMIGON y otro de
 MORTERO); el albaran trae "HA-25/B/20" -> gana el de hormigon.
+
+(jul 2026) La deteccion de familias vive ahora en
+``familia_detector.py`` (compartida con el HeaderResolverService); este
+modulo conserva la puntuacion y la decision, con el MISMO comportamiento.
 """
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Iterable, Optional
 
+from application.services.familia_detector import (
+    familias_de_texto,
+    norm_texto,
+    tokens_tecnicos,
+)
+
 logger = logging.getLogger(__name__)
-
-# Familias detectables por palabras clave / patrones en el texto.
-# El orden importa poco: se puntua cada una por separado.
-_FAMILIAS: dict[str, tuple[str, ...]] = {
-    "hormigon": ("hormigon", "hormigón", "ha-", "hm-", "hl-", "hne-"),
-    "mortero": ("mortero", "m-5", "m-7", "m-10", "m-12", "m-15", "m-20"),
-    "residuos": ("residuo", "contenedor", "rcd", "ler", "escombro"),
-    "acero": ("acero", "corrugado", "b500", "ferralla", "mallazo"),
-    "combustible": ("gasoleo", "gasóleo", "gasolina", "adblue", "carburante"),
-    "maquinaria": ("alquiler", "maquina", "máquina", "retro", "grua", "grúa"),
-}
-
-# Patron de designacion de hormigon (HA-25/B/20, HM-20...) y mortero (M-5).
-_RE_HORMIGON = re.compile(r"\bH[ALMN]E?\s?-?\s?\d{2,3}\b", re.IGNORECASE)
-_RE_MORTERO = re.compile(r"\bM-\s?\d{1,2}(?:[.,]\d)?\b", re.IGNORECASE)
 
 # Diferencia minima de puntos sobre el segundo para auto-seleccionar.
 _MARGEN_MINIMO = 2
@@ -48,33 +42,16 @@ _MARGEN_MINIMO = 2
 _PUNTOS_MINIMOS = 2
 
 
-def _norm(texto: Any) -> str:
-    return str(texto or "").lower()
-
-
-def _familias_de(texto: str) -> set[str]:
-    """Familias detectadas en un texto (por palabras clave y patrones)."""
-    fams: set[str] = set()
-    for fam, claves in _FAMILIAS.items():
-        if any(c in texto for c in claves):
-            fams.add(fam)
-    if _RE_HORMIGON.search(texto):
-        fams.add("hormigon")
-    if _RE_MORTERO.search(texto):
-        fams.add("mortero")
-    return fams
-
-
 def _texto_albaran(lineas_albaran: Iterable[Any]) -> str:
     partes = []
     for l in lineas_albaran or []:
-        partes.append(_norm(getattr(l, "codigo", None) or ""))
-        partes.append(_norm(getattr(l, "concepto", None) or ""))
+        partes.append(norm_texto(getattr(l, "codigo", None) or ""))
+        partes.append(norm_texto(getattr(l, "concepto", None) or ""))
         ctx = getattr(l, "contexto_linea", None)
         if ctx is not None:
-            partes.append(_norm(getattr(ctx, "tipo_familia", None) or ""))
+            partes.append(norm_texto(getattr(ctx, "tipo_familia", None) or ""))
             partes.append(
-                _norm(getattr(ctx, "descripcion_extendida", None) or "")
+                norm_texto(getattr(ctx, "descripcion_extendida", None) or "")
             )
     return " ".join(p for p in partes if p)
 
@@ -92,10 +69,10 @@ def _lineas_de(contrato: Any) -> list:
 
 
 def _texto_contrato(contrato: Any) -> str:
-    partes = [_norm(getattr(contrato, "nombre_contrato", None) or "")]
+    partes = [norm_texto(getattr(contrato, "nombre_contrato", None) or "")]
     for l in _lineas_de(contrato):
-        partes.append(_norm(getattr(l, "descripcion_linea", None) or ""))
-        partes.append(_norm(getattr(l, "codigo_producto", None) or ""))
+        partes.append(norm_texto(getattr(l, "descripcion_linea", None) or ""))
+        partes.append(norm_texto(getattr(l, "codigo_producto", None) or ""))
     return " ".join(p for p in partes if p)
 
 
@@ -116,7 +93,7 @@ def elegir_contrato_probable(
         return getattr(contratos[0], "codigo_contrato", None)
 
     txt_alb = _texto_albaran(lineas_albaran)
-    fams_alb = _familias_de(txt_alb)
+    fams_alb = familias_de_texto(txt_alb)
     tip = (tipologia or "").strip().lower()
     if tip and tip not in ("generico", "otro"):
         fams_alb.add(tip)
@@ -134,7 +111,7 @@ def elegir_contrato_probable(
         if not codigo:
             continue
         txt_con = _texto_contrato(c)
-        fams_con = _familias_de(txt_con)
+        fams_con = familias_de_texto(txt_con)
 
         # Puntuacion: +3 por cada familia compartida (senal fuerte);
         # -2 si el contrato es claramente de OTRA familia y no comparte
@@ -146,10 +123,8 @@ def elegir_contrato_probable(
 
         # Refuerzo: designacion tecnica exacta del albaran presente en el
         # contrato (p.ej. "ha-25" aparece en alguna descripcion).
-        for token in set(_RE_HORMIGON.findall(txt_alb)) | set(
-            _RE_MORTERO.findall(txt_alb)
-        ):
-            if _norm(token) in txt_con:
+        for token in tokens_tecnicos(txt_alb):
+            if norm_texto(token) in txt_con:
                 puntos += 2
 
         puntuados.append((puntos, codigo))

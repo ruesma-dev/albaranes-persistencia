@@ -703,6 +703,7 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
         document_id: str,
         obra_codigo_det: str | None,
         proveedor_cif_det: str | None,
+        proveedor_origen: str = "deterministic",
     ) -> None:
         """Persiste la resolucion determinista de cabecera de forma
         CONSERVADORA:
@@ -710,7 +711,12 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             origen='deterministic'. Si ya habia codigo y el origen estaba
             sin marcar -> origen='ia'. Nunca pisa un origen 'manual' ni un
             codigo existente.
-          - proveedor_cif: misma logica.
+          - proveedor_cif: misma logica. ``proveedor_origen`` (jul 2026)
+            indica COMO se dedujo el CIF: 'deterministic' (match de
+            nombre, comportamiento clasico) o 'det_familia_obra'
+            (deducido por familia de producto entre los proveedores con
+            contrato en la obra; sv4 lo penaliza mas en la confianza).
+            La columna es VARCHAR(24): se trunca defensivamente.
         """
         self.initialize()
         with self._session_factory.create_session() as session:
@@ -734,7 +740,10 @@ class SqlAlchemyAlbaranRepository(AlbaranRepository):
             cur_cif_origen = (document.proveedor_cif_origen or "").strip()
             if proveedor_cif_det and cur_cif_origen != "manual":
                 document.proveedor_cif = proveedor_cif_det
-                document.proveedor_cif_origen = "deterministic"
+                document.proveedor_cif_origen = (
+                    (proveedor_origen or "deterministic").strip()
+                    or "deterministic"
+                )[:24]
             elif cur_cif and not cur_cif_origen:
                 document.proveedor_cif_origen = "ia"
 
