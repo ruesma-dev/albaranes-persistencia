@@ -114,6 +114,7 @@ class PersistAlbaranPipeline:
             )
             self._trigger_valuation_safely(
                 merge_document_id=existing.document_id,
+                force=request.force_refetch,
             )
             selected_codigo = self._read_selected_contrato_safely(
                 merge_document_id=existing.document_id,
@@ -194,7 +195,10 @@ class PersistAlbaranPipeline:
             merge_document_id=saved.document_id,
             force_refetch=request.force_refetch,
         )
-        self._trigger_valuation_safely(merge_document_id=saved.document_id)
+        self._trigger_valuation_safely(
+            merge_document_id=saved.document_id,
+            force=request.force_refetch,
+        )
         selected_codigo = self._read_selected_contrato_safely(
             merge_document_id=saved.document_id,
         )
@@ -251,7 +255,10 @@ class PersistAlbaranPipeline:
         (input/, envelopes/), asi que aqui NO se re-persiste desde blobs:
         se ejecutan los mismos pasos que la rama de duplicado (resolver
         cabecera, enriquecer obra y contratos con force, disparar la
-        valoracion). Devuelve False si el merge no existe.
+        valoracion). ``force_refetch`` viaja hasta la valoracion
+        (MensajeValoracion.force) para que sv6 re-ejecute aunque
+        exista una valoracion previa. Devuelve False si el merge
+        no existe.
         """
         try:
             cif, obra_raw = self._repository.get_merge_cif_and_obra(
@@ -283,7 +290,10 @@ class PersistAlbaranPipeline:
             merge_document_id=merge_document_id,
             force_refetch=force_refetch,
         )
-        self._trigger_valuation_safely(merge_document_id=merge_document_id)
+        self._trigger_valuation_safely(
+            merge_document_id=merge_document_id,
+            force=force_refetch,
+        )
         return True
 
     def _enrich_obra_safely(self, *, merge_document_id: str) -> None:
@@ -370,8 +380,21 @@ class PersistAlbaranPipeline:
             )
             return None
 
-    def _trigger_valuation_safely(self, *, merge_document_id: str) -> None:
+    def _trigger_valuation_safely(
+        self,
+        *,
+        merge_document_id: str,
+        force: bool = False,
+    ) -> None:
         """Dispara el servicio 6 SOLO si hay contrato seleccionado con líneas.
+
+        ``force`` (jul 2026) — FIX re-valorado: se propaga tal cual a
+        ``trigger_async`` → ``MensajeValoracion.force`` → sv6. Antes
+        estaba HARDCODEADO a ``False`` y el re-valorado desde sv4
+        (cambio de contrato / 'Valorar ahora' sobre un documento YA
+        valorado) moría en sv6 en el cortocircuito de idempotencia
+        ('existe valoración previa; se devuelve sin re-ejecutar')
+        sin llegar nunca a sv5 ni regenerar la valoración.
 
         SIEMPRE best-effort: cualquier fallo se loguea y no rompe el pipeline
         de persistencia. El front puede pulsar 'Valorar' manualmente como
@@ -379,9 +402,10 @@ class PersistAlbaranPipeline:
         """
         logger.info(
             "[valuation-trigger][pipeline] pre-step: trigger_present=%s "
-            "merge_document_id=%s",
+            "merge_document_id=%s force=%s",
             self._valuation_trigger is not None,
             merge_document_id,
+            force,
         )
         if self._valuation_trigger is None:
             logger.info(
@@ -413,13 +437,13 @@ class PersistAlbaranPipeline:
             accepted = self._valuation_trigger.trigger_async(
                 document_id=merge_document_id,
                 codigo_contrato=codigo,
-                force=False,
+                force=force,
             )
             logger.info(
                 "[valuation-trigger][pipeline] trigger resultado=%s "
-                "document_id=%s codigo=%s",
+                "document_id=%s codigo=%s force=%s",
                 "ACCEPTED" if accepted else "REJECTED",
-                merge_document_id, codigo,
+                merge_document_id, codigo, force,
             )
         except Exception:
             logger.exception(
