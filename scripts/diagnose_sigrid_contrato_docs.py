@@ -44,6 +44,13 @@ CORRECCIÓN 2026-09-05 — cruce con la base documental:
   y es el único válido para `documents/read` / `--download-ide`, así que es
   el que viaja en `_gra_ide` (0 = el gráfico de negocio no tiene pareja
   documental; sin pareja no hay binario que descargar).
+  La DIRECCIÓN B tiene el mismo problema al revés: la búsqueda por nombre
+  corre sobre `ruesma_rep` y devuelve `ide` DOCUMENTALES, pero `rcg.gra` y
+  los `graide` son de NEGOCIO. Se traducen por `(emp, cod)` con
+  `traducir_documentales_a_negocio()` antes de buscar los vínculos, y las
+  documentales sin pareja en negocio se listan como «sin fila de negocio»
+  en vez de desaparecer. Así las dos direcciones comparan el mismo tipo de
+  ide (el documental, que es el que se descarga).
   Ver `sigrid-api/progress/explore_F-004_relacion_gra.md` (§C, §G, §H).
 """
 from __future__ import annotations
@@ -434,29 +441,67 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     return docs
 
 
-def buscar_conceptos_desde_gra(gra_ides: list[int]) -> list[dict]:
-    """Dado un conjunto de gra.ide, busca conceptos que los referencian
-    por las 4 vías (excluyendo gra.graant que es intra-gra).
+def traducir_documentales_a_negocio(gra_rep_rows: list[dict]) -> dict[int, dict]:
+    """Traduce filas de `ruesma_rep.gra` a su fila de `ruesma.gra`.
 
-    Devuelve lista con: _gra_ide, _via, _concepto_ide, + metadatos
+    La correspondencia es por `(emp, cod)`, nunca por `ide` (ver la
+    CORRECCIÓN 2026-09-05 de la cabecera). Devuelve
+    `{gra_rep_ide: {"neg_ide": int|None, "emp": ..., "cod": ...}}`.
+    `neg_ide` es None cuando la documental no tiene pareja en negocio: hay
+    76.187 así y muchas son legítimas (otros módulos, altas borradas en
+    negocio), por eso se conservan en la salida en vez de descartarlas.
     """
-    if not gra_ides:
+    vacio = {r["ide"]: {"neg_ide": None, "emp": r.get("emp"), "cod": r.get("cod")}
+             for r in gra_rep_rows}
+    cods = sorted({r.get("cod") for r in gra_rep_rows if r.get("cod")})
+    if not cods:
+        return vacio
+    marcadores = ",".join("?" for _ in cods)
+    body = run_query(
+        f"B2: traducir {len(cods)} cod documental(es) a ruesma.gra por (emp, cod)",
+        f"""
+        SELECT ide AS gra_neg_ide, emp AS gra_emp, cod AS gra_cod
+        FROM gra
+        WHERE cod IN ({marcadores})
+        """, list(cods), max_rows=500,
+    )
+    por_clave = {(r.get("gra_emp"), r.get("gra_cod")): r["gra_neg_ide"]
+                 for r in rows_to_dicts(body)}
+    for rep_ide, datos in vacio.items():
+        datos["neg_ide"] = por_clave.get((datos["emp"], datos["cod"]))
+    return vacio
+
+
+def buscar_conceptos_desde_gra(gra_neg_ides: list[int],
+                               neg_a_rep: dict[int, int]) -> list[dict]:
+    """Dado un conjunto de gra.ide DE NEGOCIO (`ruesma.gra`), busca los
+    conceptos que los referencian por las 4 vías (excluyendo gra.graant,
+    que es intra-gra).
+
+    `neg_a_rep` mapea cada ide de negocio a su ide documental, para que la
+    salida se pueda comparar con la DIRECCIÓN A y usar en la descarga.
+
+    Devuelve lista con: _gra_ide (documental), _gra_neg_ide, _via,
+    _concepto_ide, + metadatos
+    """
+    if not gra_neg_ides:
         return []
-    ides_csv = ",".join(str(i) for i in gra_ides)
+    ides_csv = ",".join(str(i) for i in gra_neg_ides)
     links: list[dict] = []
 
     # Vía rcg
     body = run_query(
         f"Inverso VÍA rcg",
         f"""
-        SELECT rcg.gra AS gra_ide, rcg.con AS con_ide,
+        SELECT rcg.gra AS gra_neg_ide, rcg.con AS con_ide,
                rcg.pos, rcg.cla
         FROM rcg
         WHERE rcg.gra IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
-        links.append({"_gra_ide": r["gra_ide"], "_via": "rcg",
+        links.append({"_gra_ide": neg_a_rep.get(r["gra_neg_ide"]),
+                      "_gra_neg_ide": r["gra_neg_ide"], "_via": "rcg",
                       "_concepto_ide": r["con_ide"],
                       "_extra": f"pos={r.get('pos')} cla={r.get('cla')}"})
 
@@ -464,14 +509,15 @@ def buscar_conceptos_desde_gra(gra_ides: list[int]) -> list[dict]:
     body = run_query(
         f"Inverso VÍA PFfir",
         f"""
-        SELECT PFfir.graide AS gra_ide, PFfir.conide AS con_ide,
+        SELECT PFfir.graide AS gra_neg_ide, PFfir.conide AS con_ide,
                PFfir.tipfir, PFfir.estfir
         FROM PFfir
         WHERE PFfir.graide IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
-        links.append({"_gra_ide": r["gra_ide"], "_via": "PFfir",
+        links.append({"_gra_ide": neg_a_rep.get(r["gra_neg_ide"]),
+                      "_gra_neg_ide": r["gra_neg_ide"], "_via": "PFfir",
                       "_concepto_ide": r["con_ide"],
                       "_extra": f"tipfir={r.get('tipfir')} estfir={r.get('estfir')}"})
 
@@ -479,26 +525,28 @@ def buscar_conceptos_desde_gra(gra_ides: list[int]) -> list[dict]:
     body = run_query(
         f"Inverso VÍA acugra",
         f"""
-        SELECT acugra.graide AS gra_ide, acugra.acuide AS con_ide
+        SELECT acugra.graide AS gra_neg_ide, acugra.acuide AS con_ide
         FROM acugra
         WHERE acugra.graide IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
-        links.append({"_gra_ide": r["gra_ide"], "_via": "acugra",
+        links.append({"_gra_ide": neg_a_rep.get(r["gra_neg_ide"]),
+                      "_gra_neg_ide": r["gra_neg_ide"], "_via": "acugra",
                       "_concepto_ide": r["con_ide"], "_extra": ""})
 
     # Vía k_acd
     body = run_query(
         f"Inverso VÍA k_acd",
         f"""
-        SELECT k_acd.graide AS gra_ide, k_acd.aceide AS con_ide
+        SELECT k_acd.graide AS gra_neg_ide, k_acd.aceide AS con_ide
         FROM k_acd
         WHERE k_acd.graide IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
-        links.append({"_gra_ide": r["gra_ide"], "_via": "k_acd",
+        links.append({"_gra_ide": neg_a_rep.get(r["gra_neg_ide"]),
+                      "_gra_neg_ide": r["gra_neg_ide"], "_via": "k_acd",
                       "_concepto_ide": r["con_ide"], "_extra": ""})
 
     return links
@@ -638,7 +686,7 @@ if find_query:
         "B1: Buscar en ruesma_rep.gra",
         """
         SELECT TOP 50
-            ide, cod, nom, nomori, fec, usu,
+            ide, emp, cod, nom, nomori, fec, usu,
             DATALENGTH(ima) AS ima_bytes
         FROM gra
         WHERE nom LIKE ? OR nomori LIKE ? OR cod LIKE ?
@@ -652,17 +700,32 @@ if find_query:
     if not gra_found:
         print(f"\n  ⚠️  Ningún gra encontrado con {find_query!r}")
     else:
-        print(f"\n  Encontrados {len(gra_found)} documento(s) en gra:")
+        print(f"\n  Encontrados {len(gra_found)} documento(s) en gra "
+              f"(ides DOCUMENTALES):")
         for d in gra_found:
             size = d.get("ima_bytes") or 0
             sz = f"{size/1024:.0f}KB" if size else "0"
-            print(f"    gra.ide={d['ide']}  nom={d.get('nom')!r}  "
+            print(f"    gra_rep_ide={d['ide']}  nom={d.get('nom')!r}  "
                   f"fec={d.get('fec')}  {sz}")
 
         gra_ides_B = {d["ide"] for d in gra_found}
 
-        # Buscar vínculos inversos de cada gra.ide
-        links_B = buscar_conceptos_desde_gra(list(gra_ides_B))
+        # Traducir documental → negocio por (emp, cod): `rcg.gra` y los
+        # `graide` apuntan a `ruesma.gra`, nunca a la documental.
+        rep_a_neg = traducir_documentales_a_negocio(gra_found)
+        for d in gra_found:
+            d["_gra_neg_ide"] = rep_a_neg[d["ide"]]["neg_ide"]
+        neg_a_rep = {v["neg_ide"]: k for k, v in rep_a_neg.items()
+                     if v["neg_ide"]}
+        sin_negocio = [d for d in gra_found if not d["_gra_neg_ide"]]
+        print(f"\n  ↔️  {len(neg_a_rep)}/{len(gra_found)} con fila de negocio "
+              f"por (emp, cod); {len(sin_negocio)} sin fila de negocio")
+        for d in sin_negocio:
+            print(f"    gra_rep_ide={d['ide']}  cod={d.get('cod')!r}  "
+                  f"emp={d.get('emp')}  — sin fila de negocio")
+
+        # Buscar vínculos inversos de cada gra.ide DE NEGOCIO
+        links_B = buscar_conceptos_desde_gra(list(neg_a_rep), neg_a_rep)
         print(f"\n  🔗 Total vínculos inversos: {len(links_B)}")
 
         # Resolver contexto para cada concepto
@@ -686,7 +749,9 @@ if find_query:
         for d in docs_B:
             size = d.get("ima_bytes") or 0
             sz = f"{size/1024:.0f}KB" if size else "0"
-            print(f"\n  gra.ide={d['ide']}  nom={d.get('nom')!r}  ({sz})")
+            print(f"\n  gra_rep_ide={d['ide']}  "
+                  f"gra_neg_ide={d.get('_gra_neg_ide') or '—'}  "
+                  f"nom={d.get('nom')!r}  ({sz})")
             for link in d.get("_links", []):
                 ctx = link.get("_ctx", {})
                 tipo = ctx.get("tipo_entidad") or "?"
@@ -712,18 +777,19 @@ if cif and obra and find_query and docs_A and docs_B:
     solo_A = gra_ides_A - gra_ides_B
     solo_B = gra_ides_B - gra_ides_A
 
-    print(f"\n  gra.ide en AMBAS direcciones ({len(en_ambos)}):")
+    print(f"\n  gra_rep_ide en AMBAS direcciones ({len(en_ambos)}):")
     for gid in sorted(en_ambos):
         nom = next((d.get("nom") for d in docs_B if d["ide"] == gid), "?")
         print(f"    {gid}  {nom!r}")
 
-    print(f"\n  gra.ide SOLO en A (desde CIF+obra, no contiene '{find_query}') "
+    print(f"\n  gra_rep_ide SOLO en A (desde CIF+obra, no contiene "
+          f"'{find_query}') "
           f"({len(solo_A)}):")
     for gid in sorted(solo_A):
         doc = next((d for d in docs_A if d["_gra_ide"] == gid), {})
         print(f"    {gid}  {doc.get('_gra_nom', '?')!r}  [{doc.get('_via')}]")
 
-    print(f"\n  gra.ide SOLO en B (contiene '{find_query}' pero no vinculado "
+    print(f"\n  gra_rep_ide SOLO en B (contiene '{find_query}' pero no vinculado "
           f"al contrato {codigo_contrato_A}) ({len(solo_B)}):")
     for gid in sorted(solo_B):
         doc = next((d for d in docs_B if d["ide"] == gid), {})

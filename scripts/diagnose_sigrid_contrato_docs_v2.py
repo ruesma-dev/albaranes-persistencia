@@ -48,6 +48,21 @@ Ejecutar:
     python scripts/diagnose_sigrid_contrato_docs_v2.py B86359866 0695
     python scripts/diagnose_sigrid_contrato_docs_v2.py B86359866 0695 --download
     python scripts/diagnose_sigrid_contrato_docs_v2.py B86359866 0695 --find "PED1.r__1"
+
+CORRECCIÓN 2026-09-05 — cruce con la base documental:
+  Las cuatro vías hacia `gra` cruzaban a `ruesma_rep.dbo.gra` por `ide`
+  (`ON rcg.gra = g.ide`) y la FASE 4 metía los `ide` DOCUMENTALES de la
+  búsqueda por nombre en `rcg.gra` / `graide`, que son de NEGOCIO. Está
+  medido que ambas cosas devuelven documentos ajenos: los `ide` de
+  `ruesma.gra` y `ruesma_rep.gra` solo coinciden en 426 filas de 2009.
+  La relación real es por **(emp, cod)**, con índice único `gra_empcod` en
+  las dos bases. Ahora las vías van `<tabla>.graide → ruesma.gra (g_neg) →
+  ruesma_rep.gra (g_rep) ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp`
+  y la FASE 4 traduce documental → negocio con
+  `traducir_documentales_a_negocio()`. `_target_ide` de un `gra` es el ide
+  DOCUMENTAL (el que acepta `documents/read`); `_neg_ide`, el de negocio.
+  Las vías hacia `dog` no cambian: `dog` vive en `ruesma` con su propio
+  binario. Ver `sigrid-api/progress/explore_F-004_relacion_gra.md`.
 """
 from __future__ import annotations
 
@@ -219,6 +234,36 @@ def rows_to_dicts(body: dict | None) -> list[dict]:
     return [dict(zip(cols, row)) for row in body["rows"]]
 
 
+def traducir_documentales_a_negocio(gra_rep_rows: list[dict]) -> dict[int, dict]:
+    """Traduce filas de `ruesma_rep.gra` a su fila de `ruesma.gra`.
+
+    La correspondencia es por `(emp, cod)`, nunca por `ide` (ver la
+    CORRECCIÓN 2026-09-05 de la cabecera). Devuelve
+    `{gra_rep_ide: {"neg_ide": int|None, "emp": ..., "cod": ...}}`.
+    `neg_ide` es None cuando la documental no tiene pareja en negocio: hay
+    76.187 así y muchas son legítimas (otros módulos, altas borradas en
+    negocio), por eso se conservan en la salida en vez de descartarlas.
+    """
+    vacio = {r["ide"]: {"neg_ide": None, "emp": r.get("emp"), "cod": r.get("cod")}
+             for r in gra_rep_rows}
+    cods = sorted({r.get("cod") for r in gra_rep_rows if r.get("cod")})
+    if not cods:
+        return vacio
+    marcadores = ",".join("?" for _ in cods)
+    body = run_query(
+        f"Traducir {len(cods)} cod documental(es) a ruesma.gra por (emp, cod)",
+        f"""\
+SELECT ide AS gra_neg_ide, emp AS gra_emp, cod AS gra_cod
+FROM gra
+WHERE cod IN ({marcadores})
+""", list(cods), max_rows=500)
+    por_clave = {(r.get("gra_emp"), r.get("gra_cod")): r["gra_neg_ide"]
+                 for r in rows_to_dicts(body)}
+    for datos in vacio.values():
+        datos["neg_ide"] = por_clave.get((datos["emp"], datos["cod"]))
+    return vacio
+
+
 def download_doc(store: str, blob_column: str, target_db: str,
                  table: str, ide: int, filename_cols: list[str],
                  out_dir: Path, fallback_name: str) -> bool:
@@ -310,17 +355,25 @@ all_links: list[dict] = []
 
 # V1: rcg
 body = run_query("V1: rcg.gra", f"""\
-SELECT rcg.gra AS gra_ide, rcg.cla AS cla, rcg.pos AS pos,
-       g.nom, g.nomori, g.cod, g.fec,
-       DATALENGTH(g.ima) AS ima_bytes
+SELECT g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+       rcg.cla AS cla, rcg.pos AS pos,
+       g_neg.nom AS nom, g_neg.nomori AS nomori,
+       g_rep.nom AS rep_nom, g_rep.nomori AS rep_nomori,
+       g_neg.cod AS cod, g_neg.emp AS emp, g_neg.fec AS fec,
+       DATALENGTH(g_rep.ima) AS ima_bytes
 FROM rcg
-LEFT JOIN {database_rep}.dbo.gra AS g ON rcg.gra = g.ide
+LEFT JOIN gra AS g_neg ON rcg.gra = g_neg.ide
+LEFT JOIN {database_rep}.dbo.gra AS g_rep
+       ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
 WHERE rcg.con = ?
 """, [ctr_ide], max_rows=100)
 for r in rows_to_dicts(body):
     all_links.append({
-        "_via": "rcg", "_store": "gra", "_target_ide": r["gra_ide"],
-        "_name": r.get("nomori") or r.get("nom") or "?",
+        "_via": "rcg", "_store": "gra",
+        "_target_ide": r.get("gra_rep_ide") or 0,
+        "_neg_ide": r.get("gra_neg_ide"),
+        "_name": (r.get("nomori") or r.get("nom")
+                  or r.get("rep_nomori") or r.get("rep_nom") or "?"),
         "_cod": r.get("cod"), "_fec": r.get("fec"),
         "_size": r.get("ima_bytes") or 0,
         "_extra": f"cla={r.get('cla')} pos={r.get('pos')}",
@@ -328,17 +381,25 @@ for r in rows_to_dicts(body):
 
 # V2: PFfir.graide
 body = run_query("V2: PFfir.graide", f"""\
-SELECT PFfir.graide AS gra_ide, PFfir.tipfir, PFfir.estfir,
-       g.nom, g.nomori, g.cod, g.fec,
-       DATALENGTH(g.ima) AS ima_bytes
+SELECT g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+       PFfir.tipfir, PFfir.estfir,
+       g_neg.nom AS nom, g_neg.nomori AS nomori,
+       g_rep.nom AS rep_nom, g_rep.nomori AS rep_nomori,
+       g_neg.cod AS cod, g_neg.emp AS emp, g_neg.fec AS fec,
+       DATALENGTH(g_rep.ima) AS ima_bytes
 FROM PFfir
-LEFT JOIN {database_rep}.dbo.gra AS g ON PFfir.graide = g.ide
+LEFT JOIN gra AS g_neg ON PFfir.graide = g_neg.ide
+LEFT JOIN {database_rep}.dbo.gra AS g_rep
+       ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
 WHERE PFfir.conide = ? AND PFfir.graide IS NOT NULL AND PFfir.graide <> 0
 """, [ctr_ide], max_rows=100)
 for r in rows_to_dicts(body):
     all_links.append({
-        "_via": "PFfir→gra", "_store": "gra", "_target_ide": r["gra_ide"],
-        "_name": r.get("nomori") or r.get("nom") or "?",
+        "_via": "PFfir→gra", "_store": "gra",
+        "_target_ide": r.get("gra_rep_ide") or 0,
+        "_neg_ide": r.get("gra_neg_ide"),
+        "_name": (r.get("nomori") or r.get("nom")
+                  or r.get("rep_nomori") or r.get("rep_nom") or "?"),
         "_cod": r.get("cod"), "_fec": r.get("fec"),
         "_size": r.get("ima_bytes") or 0,
         "_extra": f"tipfir={r.get('tipfir')} estfir={r.get('estfir')}",
@@ -346,17 +407,24 @@ for r in rows_to_dicts(body):
 
 # V3: acugra
 body = run_query("V3: acugra.graide", f"""\
-SELECT acugra.graide AS gra_ide,
-       g.nom, g.nomori, g.cod, g.fec,
-       DATALENGTH(g.ima) AS ima_bytes
+SELECT g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+       g_neg.nom AS nom, g_neg.nomori AS nomori,
+       g_rep.nom AS rep_nom, g_rep.nomori AS rep_nomori,
+       g_neg.cod AS cod, g_neg.emp AS emp, g_neg.fec AS fec,
+       DATALENGTH(g_rep.ima) AS ima_bytes
 FROM acugra
-LEFT JOIN {database_rep}.dbo.gra AS g ON acugra.graide = g.ide
+LEFT JOIN gra AS g_neg ON acugra.graide = g_neg.ide
+LEFT JOIN {database_rep}.dbo.gra AS g_rep
+       ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
 WHERE acugra.acuide = ?
 """, [ctr_ide], max_rows=100)
 for r in rows_to_dicts(body):
     all_links.append({
-        "_via": "acugra", "_store": "gra", "_target_ide": r["gra_ide"],
-        "_name": r.get("nomori") or r.get("nom") or "?",
+        "_via": "acugra", "_store": "gra",
+        "_target_ide": r.get("gra_rep_ide") or 0,
+        "_neg_ide": r.get("gra_neg_ide"),
+        "_name": (r.get("nomori") or r.get("nom")
+                  or r.get("rep_nomori") or r.get("rep_nom") or "?"),
         "_cod": r.get("cod"), "_fec": r.get("fec"),
         "_size": r.get("ima_bytes") or 0,
         "_extra": "",
@@ -364,17 +432,24 @@ for r in rows_to_dicts(body):
 
 # V4: k_acd.graide
 body = run_query("V4: k_acd.graide", f"""\
-SELECT k_acd.graide AS gra_ide,
-       g.nom, g.nomori, g.cod, g.fec,
-       DATALENGTH(g.ima) AS ima_bytes
+SELECT g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+       g_neg.nom AS nom, g_neg.nomori AS nomori,
+       g_rep.nom AS rep_nom, g_rep.nomori AS rep_nomori,
+       g_neg.cod AS cod, g_neg.emp AS emp, g_neg.fec AS fec,
+       DATALENGTH(g_rep.ima) AS ima_bytes
 FROM k_acd
-LEFT JOIN {database_rep}.dbo.gra AS g ON k_acd.graide = g.ide
+LEFT JOIN gra AS g_neg ON k_acd.graide = g_neg.ide
+LEFT JOIN {database_rep}.dbo.gra AS g_rep
+       ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
 WHERE k_acd.aceide = ?
 """, [ctr_ide], max_rows=100)
 for r in rows_to_dicts(body):
     all_links.append({
-        "_via": "k_acd→gra", "_store": "gra", "_target_ide": r["gra_ide"],
-        "_name": r.get("nomori") or r.get("nom") or "?",
+        "_via": "k_acd→gra", "_store": "gra",
+        "_target_ide": r.get("gra_rep_ide") or 0,
+        "_neg_ide": r.get("gra_neg_ide"),
+        "_name": (r.get("nomori") or r.get("nom")
+                  or r.get("rep_nomori") or r.get("rep_nom") or "?"),
         "_cod": r.get("cod"), "_fec": r.get("fec"),
         "_size": r.get("ima_bytes") or 0,
         "_extra": "",
@@ -524,10 +599,12 @@ for via in ["rcg", "PFfir→gra", "acugra", "k_acd→gra",
     marker = "✅" if count > 0 else "  "
     print(f"    {marker} {via:<20} {count}")
 
-# Deduplicar por (store, target_ide) acumulando vías
-dedup: dict[tuple[str, int], dict] = {}
+# Deduplicar por (store, target_ide, neg_ide) acumulando vías. El ide de
+# negocio entra en la clave porque `_target_ide` vale 0 en los gra sin
+# pareja documental y, sin él, dos documentos distintos colapsarían.
+dedup: dict[tuple, dict] = {}
 for link in all_links:
-    key = (link["_store"], link["_target_ide"])
+    key = (link["_store"], link["_target_ide"], link.get("_neg_ide"))
     if key in dedup:
         if link["_via"] not in dedup[key]["_via"]:
             dedup[key]["_via"] = f"{dedup[key]['_via']} + {link['_via']}"
@@ -544,7 +621,12 @@ for i, d in enumerate(unique_docs, start=1):
         f"{size/(1024*1024):.1f} MB" if size >= 1024*1024 else "SIN BINARIO"
     )
     print(f"\n  Doc {i}:  vías={d['_via']}")
-    print(f"    store           = {d['_store']}  (ide={d['_target_ide']})")
+    if d["_store"] == "gra":
+        ide_txt = (f"gra_rep_ide={d['_target_ide'] or '—'}  "
+                   f"gra_neg_ide={d.get('_neg_ide') or '—'}")
+    else:
+        ide_txt = f"ide={d['_target_ide']}"
+    print(f"    store           = {d['_store']}  ({ide_txt})")
     print(f"    nombre          = {d['_name']!r}")
     print(f"    cod             = {d.get('_cod')!r}")
     print(f"    fec             = {d.get('_fec')}")
@@ -564,7 +646,7 @@ if find_query:
 
     # Buscar en gra (ruesma_rep)
     body = run_query("Find en ruesma_rep.gra", """\
-SELECT TOP 20 ide, cod, nom, nomori, fec,
+SELECT TOP 20 ide, emp, cod, nom, nomori, fec,
        DATALENGTH(ima) AS ima_bytes
 FROM gra
 WHERE nom LIKE ? OR nomori LIKE ? OR cod LIKE ?
@@ -572,9 +654,11 @@ ORDER BY fec DESC
 """, [f"%{find_query}%", f"%{find_query}%", f"%{find_query}%"],
         max_rows=20, target_database=database_rep)
     gra_found = rows_to_dicts(body)
-    print(f"\n  Encontrados en ruesma_rep.gra: {len(gra_found)}")
+    print(f"\n  Encontrados en ruesma_rep.gra: {len(gra_found)} "
+          f"(ides DOCUMENTALES)")
     for d in gra_found:
-        print(f"    gra.ide={d['ide']}  nom={d.get('nom')!r}  fec={d.get('fec')}")
+        print(f"    gra_rep_ide={d['ide']}  nom={d.get('nom')!r}  "
+              f"fec={d.get('fec')}")
 
     # Buscar en dog (ruesma)
     body = run_query("Find en ruesma.dog", """\
@@ -595,10 +679,22 @@ ORDER BY fec DESC
 
     # Para cada gra.ide encontrado, buscar en qué tablas está vinculado
     if gra_found:
-        gra_ides = [d["ide"] for d in gra_found]
-        gra_ides_csv = ",".join(str(i) for i in gra_ides)
+        # `rcg.gra` y los `graide` son ides de NEGOCIO: hay que traducir
+        # los documentales por (emp, cod) antes de buscar los vínculos.
+        rep_a_neg = traducir_documentales_a_negocio(gra_found)
+        neg_a_rep = {v["neg_ide"]: k for k, v in rep_a_neg.items()
+                     if v["neg_ide"]}
+        sin_negocio = [(k, v) for k, v in rep_a_neg.items()
+                       if not v["neg_ide"]]
+        print(f"\n  ↔️  {len(neg_a_rep)}/{len(gra_found)} con fila de negocio "
+              f"por (emp, cod); {len(sin_negocio)} sin fila de negocio")
+        for rep_ide, datos in sin_negocio:
+            print(f"    gra_rep_ide={rep_ide}  cod={datos['cod']!r}  "
+                  f"emp={datos['emp']}  — sin fila de negocio")
 
-        print(f"\n  🔗 Vínculos inversos desde gra:")
+        gra_ides_csv = ",".join(str(i) for i in neg_a_rep) or "0"
+
+        print(f"\n  🔗 Vínculos inversos desde gra (por ide de negocio):")
         for via_name, sql in [
             ("rcg", f"SELECT gra AS gra_ide, con AS ref_ide, cla FROM rcg WHERE gra IN ({gra_ides_csv})"),
             ("PFfir", f"SELECT graide AS gra_ide, conide AS ref_ide, tipfir, estfir FROM PFfir WHERE graide IN ({gra_ides_csv})"),
@@ -632,10 +728,13 @@ ORDER BY fec DESC
                                 "OBR" if c.get("is_obr") else
                                 "PRV" if c.get("is_prv") else
                                 f"tip={c.get('tip')}")
-                        print(f"      gra.ide={r['gra_ide']} → con.ide={r['ref_ide']} "
+                        print(f"      gra_rep_ide={neg_a_rep.get(r['gra_ide'])} "
+                              f"(negocio {r['gra_ide']}) → con.ide={r['ref_ide']} "
                               f"cod={c.get('cod')!r} [{tipo}]")
                     else:
-                        print(f"      gra.ide={r['gra_ide']} → ide={r['ref_ide']} (sin con)")
+                        print(f"      gra_rep_ide={neg_a_rep.get(r['gra_ide'])} "
+                              f"(negocio {r['gra_ide']}) → ide={r['ref_ide']} "
+                              f"(sin con)")
             else:
                 print(f"\n    {via_name}: 0")
 
