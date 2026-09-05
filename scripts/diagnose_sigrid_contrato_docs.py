@@ -1,4 +1,4 @@
-# scripts/diagnose_sigrid_contrato_gra.py
+# scripts/diagnose_sigrid_contrato_docs.py
 """Diagnóstico bidireccional de documentos de contrato.
 
 Ataque desde dos direcciones para confirmar qué vínculos son reales:
@@ -20,17 +20,31 @@ Las 5 vías oficiales hacia gra (según la tabla de referencias):
 
 Modos:
 
-  python scripts/diagnose_sigrid_contrato_gra.py B86359866 0695
+  python scripts/diagnose_sigrid_contrato_docs.py B86359866 0695
       → DIRECCIÓN A: desde CIF+obra
 
-  python scripts/diagnose_sigrid_contrato_gra.py --find SUMINISTROS_DE_OBRAS_MOSTOLES
+  python scripts/diagnose_sigrid_contrato_docs.py --find SUMINISTROS_DE_OBRAS_MOSTOLES
       → DIRECCIÓN B: desde nombre
 
-  python scripts/diagnose_sigrid_contrato_gra.py B86359866 0695 --find SUMINISTROS
+  python scripts/diagnose_sigrid_contrato_docs.py B86359866 0695 --find SUMINISTROS
       → AMBAS + comparación
 
-  python scripts/diagnose_sigrid_contrato_gra.py --download-ide 274282
+  python scripts/diagnose_sigrid_contrato_docs.py --download-ide 274282
       → descarga directa
+
+CORRECCIÓN 2026-09-05 — cruce con la base documental:
+  Las cuatro vías cruzaban a `ruesma_rep.dbo.gra` por `ide`
+  (`ON rcg.gra = g.ide`). Está medido que eso devuelve documentos AJENOS:
+  los `ide` de `ruesma.gra` y `ruesma_rep.gra` solo coinciden en 426 filas
+  de 2009 y desde entonces divergen. La relación real es por **(emp, cod)**,
+  con índice único `gra_empcod` en las dos bases.
+  Ahora cada vía va `<tabla>.graide → ruesma.gra (g_neg) → ruesma_rep.gra
+  (g_rep) ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp`.
+  `gra_neg_ide` es el gráfico de negocio; `gra_rep_ide` es el DOCUMENTAL,
+  y es el único válido para `documents/read` / `--download-ide`, así que es
+  el que viaja en `_gra_ide` (0 = el gráfico de negocio no tiene pareja
+  documental; sin pareja no hay binario que descargar).
+  Ver `sigrid-api/progress/explore_F-004_relacion_gra.md` (§C, §G, §H).
 """
 from __future__ import annotations
 
@@ -265,8 +279,12 @@ if download_ide is not None:
 def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     """Dado un conjunto de con.ide, busca documentos por las 5 vías.
 
-    Devuelve lista de dicts con: _via, _gra_ide, _gra_nom, _gra_cod,
-    _gra_fec, _ima_bytes, _concepto_ide, _extra_info
+    Devuelve lista de dicts con: _via, _gra_ide, _gra_neg_ide, _gra_nom,
+    _gra_cod, _gra_fec, _ima_bytes, _concepto_ide, _extra_info
+
+    `_gra_ide` es el ide DOCUMENTAL (`ruesma_rep.gra.ide`), el que acepta
+    `documents/read`; `_gra_neg_ide` es el de negocio (`ruesma.gra.ide`),
+    al que apuntan `rcg.gra` y los `graide`. Ver CORRECCIÓN 2026-09-05.
     """
     if not con_ides:
         return []
@@ -277,21 +295,29 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     body = run_query(
         f"VÍA 1: rcg (→ {len(con_ides)} concepto(s))",
         f"""
-        SELECT rcg.con AS con_ide, rcg.gra AS gra_ide,
+        SELECT rcg.con AS con_ide,
+               g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
                rcg.pos AS rcg_pos, rcg.cla AS rcg_clase,
-               g.nom AS gra_nom, g.nomori AS gra_nomori,
-               g.cod AS gra_cod, g.fec AS gra_fec, g.usu AS gra_usu,
-               DATALENGTH(g.ima) AS ima_bytes
+               g_neg.nom AS gra_nom, g_neg.nomori AS gra_nomori,
+               g_rep.nom AS gra_rep_nom, g_rep.nomori AS gra_rep_nomori,
+               g_neg.cod AS gra_cod, g_neg.emp AS gra_emp,
+               g_neg.fec AS gra_fec, g_neg.usu AS gra_usu,
+               DATALENGTH(g_rep.ima) AS ima_bytes
         FROM rcg
-        JOIN {database_rep}.dbo.gra AS g ON rcg.gra = g.ide
+        JOIN gra AS g_neg ON rcg.gra = g_neg.ide
+        LEFT JOIN {database_rep}.dbo.gra AS g_rep
+               ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
         WHERE rcg.con IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
         docs.append({
             "_via": "rcg",
-            "_gra_ide": r["gra_ide"],
-            "_gra_nom": r.get("gra_nomori") or r.get("gra_nom") or "?",
+            "_gra_ide": r.get("gra_rep_ide") or 0,
+            "_gra_neg_ide": r.get("gra_neg_ide"),
+            "_gra_nom": (r.get("gra_nomori") or r.get("gra_nom")
+                         or r.get("gra_rep_nomori") or r.get("gra_rep_nom")
+                         or "?"),
             "_gra_cod": r.get("gra_cod"),
             "_gra_fec": r.get("gra_fec"),
             "_ima_bytes": r.get("ima_bytes") or 0,
@@ -303,13 +329,18 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     body = run_query(
         f"VÍA 2: PFfir (firmas)",
         f"""
-        SELECT PFfir.conide AS con_ide, PFfir.graide AS gra_ide,
+        SELECT PFfir.conide AS con_ide,
+               g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
                PFfir.tipfir, PFfir.estfir,
-               g.nom AS gra_nom, g.nomori AS gra_nomori,
-               g.cod AS gra_cod, g.fec AS gra_fec,
-               DATALENGTH(g.ima) AS ima_bytes
+               g_neg.nom AS gra_nom, g_neg.nomori AS gra_nomori,
+               g_rep.nom AS gra_rep_nom, g_rep.nomori AS gra_rep_nomori,
+               g_neg.cod AS gra_cod, g_neg.emp AS gra_emp,
+               g_neg.fec AS gra_fec,
+               DATALENGTH(g_rep.ima) AS ima_bytes
         FROM PFfir
-        LEFT JOIN {database_rep}.dbo.gra AS g ON PFfir.graide = g.ide
+        LEFT JOIN gra AS g_neg ON PFfir.graide = g_neg.ide
+        LEFT JOIN {database_rep}.dbo.gra AS g_rep
+               ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
         WHERE PFfir.conide IN ({ides_csv})
           AND PFfir.graide IS NOT NULL AND PFfir.graide <> 0
         """, [], max_rows=500,
@@ -317,8 +348,11 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     for r in rows_to_dicts(body):
         docs.append({
             "_via": "PFfir",
-            "_gra_ide": r["gra_ide"],
-            "_gra_nom": r.get("gra_nomori") or r.get("gra_nom") or "?",
+            "_gra_ide": r.get("gra_rep_ide") or 0,
+            "_gra_neg_ide": r.get("gra_neg_ide"),
+            "_gra_nom": (r.get("gra_nomori") or r.get("gra_nom")
+                         or r.get("gra_rep_nomori") or r.get("gra_rep_nom")
+                         or "?"),
             "_gra_cod": r.get("gra_cod"),
             "_gra_fec": r.get("gra_fec"),
             "_ima_bytes": r.get("ima_bytes") or 0,
@@ -333,20 +367,28 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     body = run_query(
         f"VÍA 3: acugra (acuerdos)",
         f"""
-        SELECT acugra.acuide AS con_ide, acugra.graide AS gra_ide,
-               g.nom AS gra_nom, g.nomori AS gra_nomori,
-               g.cod AS gra_cod, g.fec AS gra_fec,
-               DATALENGTH(g.ima) AS ima_bytes
+        SELECT acugra.acuide AS con_ide,
+               g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+               g_neg.nom AS gra_nom, g_neg.nomori AS gra_nomori,
+               g_rep.nom AS gra_rep_nom, g_rep.nomori AS gra_rep_nomori,
+               g_neg.cod AS gra_cod, g_neg.emp AS gra_emp,
+               g_neg.fec AS gra_fec,
+               DATALENGTH(g_rep.ima) AS ima_bytes
         FROM acugra
-        LEFT JOIN {database_rep}.dbo.gra AS g ON acugra.graide = g.ide
+        LEFT JOIN gra AS g_neg ON acugra.graide = g_neg.ide
+        LEFT JOIN {database_rep}.dbo.gra AS g_rep
+               ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
         WHERE acugra.acuide IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
         docs.append({
             "_via": "acugra",
-            "_gra_ide": r["gra_ide"],
-            "_gra_nom": r.get("gra_nomori") or r.get("gra_nom") or "?",
+            "_gra_ide": r.get("gra_rep_ide") or 0,
+            "_gra_neg_ide": r.get("gra_neg_ide"),
+            "_gra_nom": (r.get("gra_nomori") or r.get("gra_nom")
+                         or r.get("gra_rep_nomori") or r.get("gra_rep_nom")
+                         or "?"),
             "_gra_cod": r.get("gra_cod"),
             "_gra_fec": r.get("gra_fec"),
             "_ima_bytes": r.get("ima_bytes") or 0,
@@ -360,20 +402,28 @@ def buscar_docs_desde_concepto(con_ides: list[int]) -> list[dict]:
     body = run_query(
         f"VÍA 4: k_acd (contrata/actos)",
         f"""
-        SELECT k_acd.aceide AS ace_ide, k_acd.graide AS gra_ide,
-               g.nom AS gra_nom, g.nomori AS gra_nomori,
-               g.cod AS gra_cod, g.fec AS gra_fec,
-               DATALENGTH(g.ima) AS ima_bytes
+        SELECT k_acd.aceide AS ace_ide,
+               g_neg.ide AS gra_neg_ide, g_rep.ide AS gra_rep_ide,
+               g_neg.nom AS gra_nom, g_neg.nomori AS gra_nomori,
+               g_rep.nom AS gra_rep_nom, g_rep.nomori AS gra_rep_nomori,
+               g_neg.cod AS gra_cod, g_neg.emp AS gra_emp,
+               g_neg.fec AS gra_fec,
+               DATALENGTH(g_rep.ima) AS ima_bytes
         FROM k_acd
-        LEFT JOIN {database_rep}.dbo.gra AS g ON k_acd.graide = g.ide
+        LEFT JOIN gra AS g_neg ON k_acd.graide = g_neg.ide
+        LEFT JOIN {database_rep}.dbo.gra AS g_rep
+               ON g_rep.cod = g_neg.cod AND g_rep.emp = g_neg.emp
         WHERE k_acd.aceide IN ({ides_csv})
         """, [], max_rows=500,
     )
     for r in rows_to_dicts(body):
         docs.append({
             "_via": "k_acd",
-            "_gra_ide": r["gra_ide"],
-            "_gra_nom": r.get("gra_nomori") or r.get("gra_nom") or "?",
+            "_gra_ide": r.get("gra_rep_ide") or 0,
+            "_gra_neg_ide": r.get("gra_neg_ide"),
+            "_gra_nom": (r.get("gra_nomori") or r.get("gra_nom")
+                         or r.get("gra_rep_nomori") or r.get("gra_rep_nom")
+                         or "?"),
             "_gra_cod": r.get("gra_cod"),
             "_gra_fec": r.get("gra_fec"),
             "_ima_bytes": r.get("ima_bytes") or 0,
